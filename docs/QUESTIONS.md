@@ -4,11 +4,15 @@
 
 Genuinely open. Not rhetorical, not solved elsewhere in these docs.
 
-- **Where did `schema_void`, `schema_notes`, `schema_helpers` come from?**
-  They don't exist in `composite.py` or any graft file, so they were either a
-  typo'd guess, copied from something outdated, or a suggestion from
-  somewhere else that doesn't match this codebase version. Worth tracking
-  down before trusting any other flag names from that source.
+- ~~**Where did `schema_void`, `schema_notes`, `schema_helpers` come from?**~~
+  **RESOLVED (2026-07-24):** All three modules exist in the deployed dataset
+  bundle (`taaf source share fork (banking)/src/taaf-grafts/taaf_grafts/`):
+  - `schema_void.py` (16KB) — surprise-abort on mixed commit batches
+  - `schema_notes.py` (7KB) — static probe→observe→commit prompt note
+  - `schema_helpers.py` (20KB) — preloaded sandbox grid-analysis helpers
+  And `composite.py` handles all three explicitly (lines 208-213, 300-313,
+  335-340). The earlier conclusion that they were "inert/missing" was wrong.
+  See IDEAS.md for experiment plans using each one.
 
 - **What exactly does the game engine's level-transition wipe reset vs.
   preserve?** `recovery.py`'s R3 handoff assumes `cross_level_notes` is the

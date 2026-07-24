@@ -63,5 +63,11 @@ See QUESTIONS.md for gaps.
 | `family_store.py` | (used by transfer) | The shared store transfer reads/writes. **(surface only)** |
 | `solver_base.py` | — | Base class shared by the solver-replacement grafts. **(not read)** |
 
-## Flags that do not exist
-`schema_void`, `schema_notes`, `schema_helpers` appeared in a submitted notebook but are not defined anywhere in `composite.py` or any graft file. They're silently ignored (Python doesn't error on unused dict keys) — worth tracking down where they came from before reusing them. See QUESTIONS.md.
+## Flags confirmed present (corrected 2026-07-24)
+`schema_void`, `schema_notes`, `schema_helpers` — all three modules exist in the deployed dataset bundle AND `composite.py` handles them explicitly. Previous analysis that called them "missing/inert" was incorrect. See IDEAS.md for experiment plans.
+
+| File | Flag | Purpose |
+|---|---|---|
+| `schema_void.py` | `schema_void` | Surprise-abort on mixed commit batches: trims un-executed tails when valid-actions collapse or grid oscillation is detected. Composes OVER shortcircuit. |
+| `schema_notes.py` | `schema_notes` | Static ~100-token "SCHEMA LOOP" prompt note appended every turn: probe→observe→commit deliberation nudge. Subclasses EfficiencyToolAgent. |
+| `schema_helpers.py` | `schema_helpers` | Preloads `grid_diff`, `connected_components`, `action_effect_summary`, `recent_history` into the Python sandbox. Subclasses EfficiencyToolAgent. **Mutually exclusive with schema_notes.** |
