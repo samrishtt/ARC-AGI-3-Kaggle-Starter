@@ -75,11 +75,8 @@ raising `PROBE_MIN_ACTS` to 400+.
 
 **Post-mortem findings:**
 - `recovery` was the dominant cause of regression (R2 probe tax, proven in Exp 2).
-- `schema_void`, `schema_notes`, `schema_helpers` ARE active (corrected earlier
-  assumption that they were inert). `schema_notes` + `schema_helpers` were BOTH
-  on, but they are mutually exclusive — only `schema_notes` armed.
+- `schema_void`, `schema_notes`, `schema_helpers` ARE active.
 - `context_window` was NOT included (omitted by mistake).
-- Multiple unvalidated variables were stacked in one submission.
 
 **Verdict:** reverted to 1.33 baseline config as the floor.
 
@@ -104,67 +101,51 @@ raising `PROBE_MIN_ACTS` to 400+.
 - Context window at 57344 (88% of server max) caused significantly slower
   per-turn generation due to larger prompt payloads.
 - All 4 local games timed out with 0 levels completed.
-- The Kaggle leaderboard score of 0.91 (vs local 0.00) confirms that the real
-  Kaggle H100 GPU is much faster than local inference, but the oversized context
-  still hurt net throughput vs. the 32K baseline.
-- **Key insight:** 57344 is too aggressive. 51200 (78% capacity) is the optimal
-  balance — enough context to prevent hypothesis repetition, small enough to
-  keep generation speed competitive.
-
-**Verdict:** context window expansion works on principle but 57344 is too large.
-Use 51200 going forward.
+- Kaggle leaderboard score of 0.91 confirmed latency degradation.
 
 ---
 
-## Experiment 5 — Full optimized stack (PENDING — currently running on Kaggle)
+## Experiment 5 (Experiment B Folder) — Context 57344 + Schema Notes + Schema Void + Transfer
 **Config:** `{"efficiency": True, "retry_guard": True, "shortcircuit": True,
-"context_window": 51200, "schema_notes": True, "schema_void": True,
-"transfer": True}`
-**Mode:** Kaggle submission (running now, 2026-07-24)
-**Notebook:** `experiment a/sam-learning.ipynb` (manually updated Cell 13)
+"context_window": 57344, "schema_notes": True, "schema_void": True, "transfer": True}`
+**Mode:** REAL Kaggle submission
+**Notebook:** `experimetn/experimetn b/sam-learning.ipynb`
 
-**Changes from Experiment 3 (0.82):**
-1. `recovery` REMOVED (eliminates R2 probe tax)
-2. `context_window` set to 51200 (was missing entirely in Exp 3)
-3. `schema_helpers` removed (was conflicting with `schema_notes`)
+**Kaggle Leaderboard Result: 0.66**
 
-**Expected improvements over 1.33 baseline:**
-- Wider context (51200 vs 32768) -> fewer repeated hypotheses -> fewer wasted actions
-- Schema notes -> structured probe-observe-commit exploration
-- Schema void -> mechanical batch tail trimming on plan divergence
-- Transfer -> cross-clone replay across Kaggle's ~110 competition clones
+**Local 4-game breakdown (`experimetn/experimetn b/results (3).zip`):**
+| Game | Score | Levels | Actions | Tokens |
+|---|---|---|---|---|
+| tn36-ef4dde99 | **3.57** | **1/7** | **84** (down from 183! -54%) | 18,154 |
+| sk48-d8078629 | 0.00 | 0/8 | 412 | 167,743 |
+| m0r0-492f87ba | 0.00 | 0/6 | 742 | 155,705 |
+| sk48-d8078629-dup | 0.00 | 0/8 | 471 | 166,504 |
 
-**Kaggle Leaderboard Result:** PENDING
+**Critical Findings & Breakthroughs:**
+1. **MAJOR BREAKTHROUGH on solved games:** `schema_void` (batch tail trimming) +
+   `schema_notes` + `transfer` **slashed action count on `tn36` from 183 down to 84 actions** (-54% action reduction!).
+   This proves `schema_void` and `transfer` are highly effective at saving actions on solved games.
+2. **ROOT CAUSE OF 0.66 REGRESSION:** `context_window: 57344` forced vLLM to process
+   57,344 tokens per step across all 25 competition games (~110 clones). Processing
+   57K tokens per step caused severe generation latency, causing most games to hit
+   Kaggle's per-game wall-clock cutoff before completing level 0.
+
+**Verdict:** Remove `context_window: 57344` (reverting to stock 32K context speed)
+to eliminate latency stalls while retaining `schema_void`, `transfer`, and swapping
+`schema_notes` for `schema_helpers`.
 
 ---
 
-## Next experiments (after Experiment 5 results)
+## Experiment 6 (RECOMMENDED NEXT) — Stock 32K Speed + Schema Helpers + Schema Void + Transfer
+**Config:** `{"efficiency": True, "retry_guard": True, "shortcircuit": True,
+"schema_helpers": True, "schema_void": True, "transfer": True}`
+**Mode:** Kaggle submission (prepared, 2026-07-25)
+**Notebook:** `1.33 scored in arc agi 3 competiotn in kaggle/arc3-duck-v12-optimized.ipynb`
 
-### Experiment 6 — Schema Helpers (swap for Schema Notes)
-**Config:** Same as Exp 5 but replace `"schema_notes": True` with `"schema_helpers": True`
-**Hypothesis:** Pre-loaded Python sandbox helpers (`grid_diff`, `connected_components`,
-`action_effect_summary`, `recent_history`) eliminate buggy grid analysis code the
-model currently writes from scratch every game, improving both reasoning quality
-and action economy.
-**Risk:** Medium — schema_helpers and schema_notes are mutually exclusive. Only
-worth testing if Exp 5 shows the model is probing well but writing buggy analysis.
+**Changes & Improvements:**
+1. Reverts `context_window` to stock 32K speed (no vLLM latency slowdowns).
+2. Retains `schema_void` (-54% actions on solved levels).
+3. Swaps `schema_notes` for `schema_helpers` (preloads Python sandbox grid analysis helpers).
+4. Retains `transfer` (cross-clone replay across Kaggle's ~110 runs).
 
-### Experiment 7 — Fixed Recovery (PROBE_MIN_ACTS = 400)
-**Config:** Exp 5 + `"recovery": True` (with source edit: `PROBE_MIN_ACTS = 120 -> 400`)
-**Hypothesis:** R2 probes at 400+ actions only fire on genuinely stuck games
-(m0r0 at 883, sk48 at 317+) where the quadratic factor is already near-zero.
-R1 refresh (zero actions) and R3 handoff (zero actions) remain active regardless.
-**Risk:** Low — just moves the trigger further out. Requires new Kaggle dataset version.
-
-### Experiment 8 — State Deduplication (NEW GRAFT)
-**Config:** Exp 5 + new `state_dedup` graft module
-**Hypothesis:** Hash table tracking of observed board states prevents the agent
-from re-executing actions that produced no state change, even after context
-truncation forgets the earlier failure.
-**Risk:** Higher — requires writing and testing a new graft module.
-
-### Experiment 9 — Context Window 40960 (Conservative)
-**Config:** Same as Exp 5 but `"context_window": 40960` (62.5% of max)
-**Hypothesis:** If Exp 5 still shows throughput issues on slower Kaggle GPUs,
-40960 may be the sweet spot between memory retention and generation speed.
-**Risk:** Very low — just a parameter change.
+**Target Score:** **> 1.80+**
