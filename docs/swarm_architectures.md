@@ -30,3 +30,18 @@ To avoid the 12-hour timeout, a True Swarm CANNOT be used on every single puzzle
 
 **Pros:** Extremely high reasoning quality for complex puzzles.
 **Cons:** High risk of wall-clock timeouts. Requires complex state management and routing logic inside the `ToolAgent` execution loop.
+
+## Idea 3: Dynamic Agent Scaling (The Triage Swarm)
+A brilliant evolution to beat the Kaggle 12-hour limit by using a sliding scale of compute power based on puzzle complexity.
+
+**How it works:**
+1. **The "Scout" Phase:** For every puzzle, we initially send in just *one* fast agent. If it's a simple puzzle (like recoloring a few pixels) and it passes the training examples immediately, we submit the answer and move on.
+2. **The "Dynamic Swarm" Phase:** If the Scout agent fails or determines the puzzle has extreme complexity (e.g., massive grid with physics logic), the system flags it as a "Boss Level."
+3. **Spawning the Army:** Because time was saved on easy puzzles, the system dynamically spawns 5 to 20 specialized agents specifically for this hard puzzle:
+   - *Rotation Agent*: Focuses solely on geometric rotation.
+   - *Color Agent*: Focuses purely on color mapping.
+   - *Physics Agent*: Focuses on gravity/connectivity logic.
+   - *Manager Agent*: Collects hypotheses and tests them in the sandbox.
+
+**Pros:** Maximum compute is only spent where it is mathematically necessary. Prevents Kaggle timeouts while allowing deep exploration on hard puzzles.
+**Cons:** The orchestration logic required to pause, spawn, and sync 20 async agents inside the TAAF loop is highly complex to implement.
