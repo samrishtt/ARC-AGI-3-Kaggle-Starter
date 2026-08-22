@@ -9,18 +9,25 @@ enough actions to finish a level scores nothing at all - which is exactly what
 happened (781 actions on sk48 level 0, baseline 61, never completed).
 
 The engine, however, is a pure-Python in-process object we can ``deepcopy`` and
-step at ~6,800 actions/sec for free (``verify_twin.py`` proves this on 25/25
-games). So we decouple "actions taken" from "LLM calls": search millions of
-actions locally, then replay one short winning line to the graded environment.
+step at ~700 actions/sec for free, sustained, including the deepcopy cost of
+restarting dead clones. That is ~12,000x more actions per second than the LLM
+agent managed. So we decouple "actions taken" from "LLM calls": search
+hundreds of thousands of actions locally, then replay one short winning line to
+the graded environment.
 
 THE ALGORITHM (four general ideas, no game-specific logic anywhere)
 ------------------------------------------------------------------
-1. ARCHIVE / GO-EXPLORE. Keep a map from "situation" (hash of the 64x64 frame
-   plus the level index) to the *shortest known action plan* that reaches it.
-   Repeatedly: pick a promising archived situation, restore it, explore from
-   there, and file away every new situation found. This is what beats sparse
-   reward - no reward shaping, no domain knowledge, just "have I ever seen this
-   frame before?".
+1. ARCHIVE / GO-EXPLORE. Keep a map from "situation" to the *shortest known
+   action plan* that reaches it. Repeatedly: pick a promising archived
+   situation, restore it, explore from there, and file away every new situation
+   found. This is what beats sparse reward - no reward shaping, no domain
+   knowledge, just "have I ever seen this situation before?".
+
+   What counts as "the same situation" is the whole ballgame, and it is not the
+   raw frame - a HUD timer draining one pixel per action makes every raw frame
+   unique, which silently reduces this to a random walk. ``cell.py`` calibrates
+   a coarse key that discards clock-like pixels. Read its docstring; it is the
+   single most important design decision in here.
 
 2. ENGINE-EXACT ACTION SETS. ``_get_valid_actions()`` hands us the legal moves
    *including* concrete ACTION6 click coordinates, collapsing a 4096-wide
@@ -62,6 +69,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
+from arc3x.cell import CellKey, calibrate
 from arc3x.twin import Act, Obs, Twin, default_env_dir
 
 # ---------------------------------------------------------------------------
@@ -174,6 +182,7 @@ class Node:
     visits: int = 0
     snap: Any = None  # cached engine snapshot; may be dropped to save memory
     noop: set[Act] = field(default_factory=set)
+    tried: set[Act] = field(default_factory=set)
     dead: bool = False
 
     @property
@@ -181,9 +190,32 @@ class Node:
         return len(self.plan)
 
     @property
+    def untried(self) -> int:
+        """How many legal actions have never been taken from this cell."""
+        if not self.valid:
+            return 0
+        return sum(1 for a in self.valid if a not in self.tried and a not in self.noop)
+
+    @property
     def weight(self) -> float:
-        """Go-Explore selection weight: prefer unvisited and shallow cells."""
-        return 1.0 / ((self.visits + 1) ** 0.5 * (self.depth + 1) ** 0.25)
+        """Selection weight: prefer cells with unexplored options, then shallow.
+
+        The original weight was ``1/(sqrt(visits+1) * (depth+1)^0.25)`` - pure
+        novelty. Combined with a random rollout policy that never recorded which
+        actions it had already taken from a cell, the search re-tried the same
+        few actions from the same cells indefinitely and never systematically
+        covered the reachable set.
+
+        Tracking ``tried`` turns this into something much closer to a
+        breadth-first sweep of the abstract cell graph: a cell with unexplored
+        actions outranks one that is fully expanded, and because the archive
+        always keeps the *shortest* plan to each cell, the first solution found
+        is near-minimal in actions - which is exactly what the quadratic score
+        rewards. A fully expanded cell keeps a small residual weight rather than
+        zero, since its successors' plans may later shorten.
+        """
+        frontier = 4.0 if self.untried > 0 else 0.25
+        return frontier / ((self.visits + 1) ** 0.5 * (self.depth + 1) ** 0.25)
 
 
 @dataclass
@@ -204,30 +236,45 @@ class Explorer:
         self,
         twin: Twin,
         *,
+        cell: CellKey,
         seed: int = 0,
         sticky: float = 0.7,
         rollout: int = 48,
         max_depth: int = 1500,
-        snap_cap: int = 4000,
+        snap_cap: int = 3000,
+        snap_min_depth: int = 16,
         verbose: bool = True,
     ):
         self.twin = twin
+        self.cell = cell
         self.rng = np.random.default_rng(seed)
         self.sticky = sticky
         self.rollout = rollout
         self.max_depth = max_depth
         self.snap_cap = snap_cap
+        self.snap_min_depth = snap_min_depth
         self.verbose = verbose
         self.steps = 0
+        self.snaps = 0
 
     # -- plumbing ---------------------------------------------------------
 
     def _restore(self, root: Any, node: Node) -> Any:
         """Get a fresh engine object positioned at ``node``.
 
-        Cached snapshot if we kept one, otherwise deterministic replay from the
-        level root. Replay is exact because the games are deterministic
-        (verified 25/25), and at ~6,800 steps/sec a 300-action replay is ~44 ms.
+        SNAPSHOT POLICY (this is the performance fix).
+
+        ``copy.deepcopy(game)`` costs ~20 ms, while stepping the engine costs
+        ~1.2 ms. The original code snapshotted **every newly archived cell** -
+        and with a near-bijective key a new cell was created on almost every
+        step, so the search paid a full 20 ms deepcopy per step. Measured
+        result: 19 steps/sec against a ~700 steps/sec ceiling.
+
+        Snapshots are now taken only when a node is actually *restored*, which
+        happens once per rollout rather than once per step - roughly 48x less
+        often. We also skip snapshotting shallow nodes, because replaying a
+        16-action prefix (~19 ms) is already as cheap as the deepcopy itself.
+        Replay is exact: the games are verified deterministic on 25/25.
         """
         if node.snap is not None:
             return copy.deepcopy(node.snap)
@@ -235,6 +282,9 @@ class Explorer:
         for a in node.plan:
             Twin.step_game(g, a)
             self.steps += 1
+        if node.depth >= self.snap_min_depth and self.snaps < self.snap_cap:
+            node.snap = copy.deepcopy(g)
+            self.snaps += 1
         return g
 
     def _select(self, nodes: list[Node], k: int = 24) -> Node:
@@ -275,7 +325,6 @@ class Explorer:
         )
         archive: dict[bytes, Node] = {root_node.key: root_node}
         order: list[Node] = [root_node]
-        snaps = 1
 
         best_plan: tuple[Act, ...] | None = None
         won_game = False
@@ -287,11 +336,10 @@ class Explorer:
             node.visits += 1
             g = self._restore(root, node)
             plan = list(node.plan)
+            cur_node: Node = node
             cur_valid = node.valid or valid0
             cur_frame = None
             prev: Act | None = None
-            local_key = node.key
-            local_noop = node.noop
             new_cells = 0
             grouped = cur_valid
             refresh = 0
@@ -301,19 +349,40 @@ class Explorer:
                     break
                 if not cur_valid:
                     break
-                if refresh <= 0 and cur_frame is not None:
-                    grouped = reduce_clicks(cur_frame, cur_valid)
-                    refresh = 8
-                elif refresh <= 0:
-                    grouped = cur_valid
+                if refresh <= 0:
+                    grouped = (
+                        reduce_clicks(cur_frame, cur_valid)
+                        if cur_frame is not None
+                        else cur_valid
+                    )
                     refresh = 8
                 refresh -= 1
 
-                pool = [a for a in grouped if a not in local_noop] or list(grouped)
-                if prev is not None and prev in pool and self.rng.random() < self.sticky:
+                # Systematic before random: an action never taken from this cell
+                # beats one already tried. Without this the rollout kept picking
+                # the same few actions from the same cells forever and never
+                # covered the reachable set.
+                fresh = [
+                    a for a in grouped if a not in cur_node.tried and a not in cur_node.noop
+                ]
+                pool = (
+                    fresh
+                    or [a for a in grouped if a not in cur_node.noop]
+                    or list(grouped)
+                )
+                # Stickiness lets grid games cross a room with one repeated move,
+                # but repeating a *click* is nearly always wasted, so only stick
+                # on non-click actions. Purely action-type derived, not per-game.
+                if (
+                    prev is not None
+                    and not prev.is_click
+                    and prev in pool
+                    and self.rng.random() < self.sticky
+                ):
                     a = prev
                 else:
                     a = pool[int(self.rng.integers(len(pool)))]
+                cur_node.tried.add(a)
 
                 obs = Twin.step_game(g, a)
                 self.steps += 1
@@ -329,40 +398,36 @@ class Explorer:
                     break
                 if obs.game_over:
                     # Dead branch: file it as dead so we never restore into it.
-                    dk = obs.key()
+                    dk = self.cell(obs.frame, obs.level)
                     if dk not in archive:
                         archive[dk] = Node(dk, tuple(plan), obs.level, (), dead=True)
                     break
 
-                k = obs.key()
-                if k == local_key:
-                    # Same frame and (usually) same options -> a no-op here.
-                    local_noop.add(a)
+                k = self.cell(obs.frame, obs.level)
+                if k == cur_node.key:
+                    # Same cell and same options -> a no-op here; never retry it.
+                    cur_node.noop.add(a)
                     plan.pop()
                     prev = None
                     continue
-                local_noop = set()
-                local_key = k
                 cur_valid = obs.valid
                 cur_frame = obs.frame
 
                 old = archive.get(k)
                 if old is None:
+                    # No snapshot here on purpose - see _restore's docstring.
                     nd = Node(k, tuple(plan), obs.level, obs.valid)
-                    if snaps < self.snap_cap:
-                        nd.snap = copy.deepcopy(g)
-                        snaps += 1
                     archive[k] = nd
                     order.append(nd)
                     new_cells += 1
-                elif len(plan) < old.depth and not old.dead:
-                    # Cheaper route to a known situation - keep the short one.
-                    old.plan = tuple(plan)
-                    old.valid = obs.valid
-                    old.snap = copy.deepcopy(g) if old.snap is not None else None
-                    local_noop = old.noop
-
-            node.noop |= local_noop if node.key == local_key else set()
+                    cur_node = nd
+                else:
+                    if len(plan) < old.depth and not old.dead:
+                        # Cheaper route to a known situation - keep the short one.
+                        old.plan = tuple(plan)
+                        old.valid = obs.valid
+                        old.snap = None  # stale: taken for the longer plan
+                    cur_node = old
 
             # Adaptive rollout length: if nothing new turns up, look further.
             if new_cells == 0:
@@ -398,12 +463,18 @@ class Explorer:
         return False
 
     def _keys_along(self, root: Any, plan: Sequence[Act]) -> list[bytes]:
+        """Cell id after each action, for loop detection during compression.
+
+        This must use the calibrated cell key, not the raw frame. With the raw
+        frame a HUD timer made every state unique, so "the same situation twice"
+        never happened and the loop-splice pass below could never fire at all.
+        """
         g = copy.deepcopy(root)
         keys: list[bytes] = [b"START"]
         for a in plan:
             obs = Twin.step_game(g, a)
             self.steps += 1
-            keys.append(obs.key())
+            keys.append(self.cell(obs.frame, obs.level))
             if obs.terminal:
                 break
         return keys
@@ -493,8 +564,18 @@ def solve_game(
     root = twin.snapshot()
     # Every graded run starts with RESET; do the same here so the plan we hand
     # back is replayable verbatim from a fresh game.
-    ex = Explorer(twin, seed=seed, verbose=verbose)
     Twin.step_game(root, Act(0))
+
+    # Learn which pixels carry state before searching. ~600 simulated actions,
+    # under a second, zero graded actions. Without this the archive key is
+    # bijective and Go-Explore degenerates into a random walk.
+    cell = calibrate(root, seed=seed)
+    if verbose:
+        print(
+            f"  cell key: {cell.n_informative} informative px "
+            f"({cell.n_varying} varying, {cell.n_clock} clock/HUD discarded)"
+        )
+    ex = Explorer(twin, cell=cell, seed=seed, verbose=verbose)
 
     full: list[Act] = []
     per_level: list[int] = []
