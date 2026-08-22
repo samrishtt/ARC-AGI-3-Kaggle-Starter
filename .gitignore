@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Large competition / experiment artifacts: re-downloadable or re-derivable.
+# Scores live in benchmark.json; these are the raw rollout dumps.
+*.zip
+intermediate_states.pkl
+*.per_game_cards.pkl
+
+# Search output
+plans/
+*.plans.json
