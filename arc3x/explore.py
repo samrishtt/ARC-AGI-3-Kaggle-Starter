@@ -244,6 +244,9 @@ class Explorer:
         snap_cap: int = 250,
         snap_min_depth: int = 16,
         verbose: bool = True,
+        recorder: Any | None = None,
+        prior: Any | None = None,
+        prior_mix: float = 0.6,
     ):
         self.twin = twin
         self.cell = cell
@@ -254,8 +257,18 @@ class Explorer:
         self.snap_cap = snap_cap
         self.snap_min_depth = snap_min_depth
         self.verbose = verbose
+        # Optional self-imitation recorder (see arc3x/selfplay_data.py) and
+        # optional learned action prior (arc3x/student.py). Both default off so
+        # the search's measured behaviour is unchanged unless asked for.
+        self.recorder = recorder
+        self.prior = prior
+        self.prior_mix = prior_mix
         self.steps = 0
         self.snaps = 0
+        # Plans that looked like a win inside their own rollout but failed to
+        # replay from a fresh engine. Should stay 0; non-zero means the rollout
+        # bookkeeping has desynchronised from the engine again.
+        self.false_plans = 0
 
     # -- plumbing ---------------------------------------------------------
 
@@ -399,24 +412,42 @@ class Explorer:
                     and self.rng.random() < self.sticky
                 ):
                     a = prev
+                elif self.prior is not None and cur_frame is not None and len(pool) > 1:
+                    # Learned prior, mixed with uniform so coverage is preserved:
+                    # every legal action keeps at least (1-mix)/n probability, so
+                    # a wrong prior slows the search but cannot make a state
+                    # unreachable. Go-Explore's guarantee is coverage; the prior
+                    # only reorders it.
+                    p = self.prior.prior(cur_frame, pool)
+                    p = self.prior_mix * p + (1.0 - self.prior_mix) / len(pool)
+                    p = p / p.sum()
+                    a = pool[int(self.rng.choice(len(pool), p=p))]
                 else:
                     a = pool[int(self.rng.integers(len(pool)))]
                 cur_node.tried.add(a)
 
+                frame_before = cur_frame
+                legal_before = tuple(pool)
                 obs = Twin.step_game(g, a)
                 self.steps += 1
                 plan.append(a)
                 prev = a
 
                 if obs.won:
+                    if self.recorder is not None:
+                        self.recorder.add(frame_before, a, legal_before, "level")
                     best_plan = tuple(plan)
                     won_game = True
                     break
                 if obs.level > start_level:
+                    if self.recorder is not None:
+                        self.recorder.add(frame_before, a, legal_before, "level")
                     best_plan = tuple(plan)
                     break
                 if obs.game_over:
                     # Dead branch: file it as dead so we never restore into it.
+                    if self.recorder is not None:
+                        self.recorder.add(frame_before, a, legal_before, "dead")
                     dk = self.cell(obs.frame, obs.level)
                     if dk not in archive:
                         archive[dk] = Node(dk, tuple(plan), obs.level, (), dead=True)
@@ -424,16 +455,38 @@ class Explorer:
 
                 k = self.cell(obs.frame, obs.level)
                 if k == cur_node.key:
-                    # Same cell and same options -> a no-op here; never retry it.
+                    # Landed in the same cell. Record it as unproductive so this
+                    # cell stops re-trying it, but DO NOT remove it from `plan`.
+                    #
+                    # The action was really applied to `g`. The cell key is a
+                    # deliberately coarse abstraction, so "same cell" does not
+                    # mean "same engine state" - a counter may have moved, an
+                    # object may have shifted inside a masked-out region. An
+                    # earlier version popped the action here, which desynchronised
+                    # `plan` from `g`: every later action in that rollout was
+                    # recorded against a state it was not taken from, so a plan
+                    # that completed a level in the search failed on replay.
+                    # Measured cost of that bug: tu93 claimed 1 level and
+                    # replayed 0, sp80 claimed 2 and replayed 1, lp85 claimed 5
+                    # and replayed 4 - always the level found by the rollout that
+                    # had dropped actions. compress() could not catch it because
+                    # it verifies its own edits but never its starting plan.
                     cur_node.noop.add(a)
-                    plan.pop()
                     prev = None
+                    cur_valid = obs.valid or cur_valid
+                    cur_frame = obs.frame
                     continue
                 cur_valid = obs.valid
                 cur_frame = obs.frame
 
                 old = archive.get(k)
                 if old is None:
+                    # This action reached a state the search had never seen. By
+                    # the cell abstraction's own definition that is progress, so
+                    # it is a correct imitation target - and there are ~10,000x
+                    # more of these than there are actions in the final plan.
+                    if self.recorder is not None:
+                        self.recorder.add(frame_before, a, legal_before, "new")
                     # No snapshot here on purpose - see _restore's docstring.
                     nd = Node(k, tuple(plan), obs.level, obs.valid)
                     archive[k] = nd
@@ -447,6 +500,32 @@ class Explorer:
                         old.valid = obs.valid
                         old.snap = None  # stale: taken for the longer plan
                     cur_node = old
+
+            # VERIFY BEFORE BELIEVING.
+            #
+            # A rollout reports success from *inside* its own trajectory: `plan`
+            # is what the rollout thinks it did, and `g` is what the engine
+            # actually did. Those two can drift apart - they did, via a dropped
+            # no-op action - and when they drift the search happily returns a
+            # plan that never worked, which `compress` then passes through
+            # untouched because it only verifies its own edits.
+            #
+            # A plan is worth exactly as much as a fresh engine's willingness to
+            # replay it. One replay of <=max_depth actions costs ~0.5 s of
+            # simulation against a 300 s budget, and it converts "claimed
+            # levels" into "levels that will actually score on the gateway".
+            # If it fails we throw the plan away and keep searching.
+            if best_plan is not None and not self._reaches(
+                root, best_plan, start_level + 1
+            ):
+                self.false_plans += 1
+                if self.verbose:
+                    print(
+                        f"    L{start_level}: rejected a {len(best_plan)}-action "
+                        f"plan that did not replay (#{self.false_plans})"
+                    )
+                best_plan = None
+                won_game = False
 
             # Adaptive rollout length: if nothing new turns up, look further.
             if new_cells == 0:
@@ -508,9 +587,17 @@ class Explorer:
         Two general passes, both purely mechanical:
           * loop splice - if the same frame appears twice, cut what is between.
           * window drop - try deleting runs of 16/8/4/2/1 actions.
+
+        Both passes verify each *edit* by replay, which is not the same as
+        verifying the *input*: an invalid plan with no accepted edits used to be
+        returned unchanged and counted as a solved level. So the input is
+        checked first, and an unreplayable plan comes back empty - callers treat
+        an empty plan as "level not solved", which is the honest answer.
         """
         t0 = time.perf_counter()
         cur = list(plan)
+        if not cur or not self._reaches(root, cur, target_level):
+            return ()
 
         # pass 1: loop removal, biggest loops first
         improved = True
@@ -576,6 +663,9 @@ def solve_game(
     verbose: bool = True,
     max_levels: int | None = None,
     restarts: int = 3,
+    recorder: Any | None = None,
+    prior: Any | None = None,
+    prior_mix: float = 0.6,
 ) -> GameSolution:
     """Search a whole game level by level; return one concatenated plan."""
     t0 = time.perf_counter()
@@ -597,7 +687,15 @@ def solve_game(
             f"  cell key: {cell.n_informative} informative px "
             f"({cell.n_varying} varying, {cell.n_clock} clock/HUD discarded)"
         )
-    ex = Explorer(twin, cell=cell, seed=seed, verbose=verbose)
+    ex = Explorer(
+        twin,
+        cell=cell,
+        seed=seed,
+        verbose=verbose,
+        recorder=recorder,
+        prior=prior,
+        prior_mix=prior_mix,
+    )
 
     full: list[Act] = []
     per_level: list[int] = []
@@ -642,6 +740,13 @@ def solve_game(
                 )
             break
         tight = ex.compress(root, res.plan, level + 1, budget_s=min(share * 0.25, 30.0))
+        if not tight:
+            # compress() returns empty only when the plan does not replay from a
+            # fresh engine. Reporting the level anyway would inflate the local
+            # score and score zero on the gateway, so stop here instead.
+            if verbose:
+                print(f"  L{level}: plan failed verification - not counted")
+            break
         sc = level_score(base, len(tight))
         if verbose:
             print(
