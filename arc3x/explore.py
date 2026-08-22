@@ -241,7 +241,7 @@ class Explorer:
         sticky: float = 0.7,
         rollout: int = 48,
         max_depth: int = 1500,
-        snap_cap: int = 3000,
+        snap_cap: int = 250,
         snap_min_depth: int = 16,
         verbose: bool = True,
     ):
@@ -286,6 +286,25 @@ class Explorer:
             node.snap = copy.deepcopy(g)
             self.snaps += 1
         return g
+
+    def _reclaim(self, order: list[Node]) -> None:
+        """Drop snapshots of fully-expanded cells to bound memory.
+
+        A snapshot is a whole deepcopied game object. Holding thousands of them
+        per process is what silently destroyed the parallel sweep: measured 24
+        steps/sec/worker with 10 workers against 546 single-process, which is
+        memory thrash, not CPU starvation (12 cores were available). Kaggle's
+        RAM is tighter still, so the cap has to be small and enforced.
+
+        Cells with no untried actions left are the right ones to evict: we have
+        already enumerated their successors, so restoring them is low value.
+        """
+        freed = 0
+        for nd in order:
+            if nd.snap is not None and nd.untried == 0 and nd.visits > 0:
+                nd.snap = None
+                freed += 1
+        self.snaps = max(0, self.snaps - freed)
 
     def _select(self, nodes: list[Node], k: int = 24) -> Node:
         """Tournament selection - O(k), not O(len(archive)) per rollout."""
@@ -437,6 +456,8 @@ class Explorer:
                     barren = 0
             else:
                 barren = 0
+            if self.snaps >= self.snap_cap:
+                self._reclaim(order)
 
         return LevelResult(
             level=start_level,
@@ -554,6 +575,7 @@ def solve_game(
     seed: int = 0,
     verbose: bool = True,
     max_levels: int | None = None,
+    restarts: int = 3,
 ) -> GameSolution:
     """Search a whole game level by level; return one concatenated plan."""
     t0 = time.perf_counter()
@@ -584,12 +606,39 @@ def solve_game(
         left = budget_s - (time.perf_counter() - t0)
         share = min(left, per_level_cap or left)
         base = baselines[level] if level < len(baselines) else 100
-        res = ex.solve_level(root, level, base, share * 0.75)
-        if res.plan is None:
+
+        # Restarts. solve_level is a randomised search, and randomised search on
+        # this kind of problem has a heavy-tailed runtime: an unlucky opening can
+        # trap a rollout distribution in a dead region for the whole budget while
+        # a different seed escapes in seconds. Re-seeding and starting the
+        # archive fresh is strictly better than spending the tail of the budget
+        # in a search that has already stopped finding cells. The old code also
+        # simply discarded the 25% reserved for compression whenever a level
+        # failed, which is pure waste.
+        res = None
+        spent = 0.0
+        for attempt in range(restarts):
+            budget_here = share * 0.75 - spent
+            if budget_here <= 1.0:
+                break
+            slice_s = budget_here if attempt == restarts - 1 else budget_here * 0.55
+            ex.rng = np.random.default_rng(seed + 1013 * (level + 1) + attempt)
+            a0 = time.perf_counter()
+            res = ex.solve_level(root, level, base, slice_s)
+            spent += time.perf_counter() - a0
+            if res.plan is not None:
+                break
             if verbose:
                 print(
-                    f"  L{level}: NOT SOLVED  cells={res.cells:,} "
-                    f"steps={ex.steps:,} {res.seconds:.1f}s"
+                    f"  L{level}: attempt {attempt + 1} failed  cells={res.cells:,} "
+                    f"{res.seconds:.1f}s"
+                )
+        if res is None or res.plan is None:
+            if verbose:
+                cells = res.cells if res else 0
+                print(
+                    f"  L{level}: NOT SOLVED  cells={cells:,} "
+                    f"steps={ex.steps:,} {spent:.1f}s"
                 )
             break
         tight = ex.compress(root, res.plan, level + 1, budget_s=min(share * 0.25, 30.0))
@@ -611,6 +660,23 @@ def solve_game(
         level += 1
         if res.won_game:
             break
+
+        # RE-CALIBRATE. The mask is `varies & ~clock`, learned by probing one
+        # root, so it describes *that level's* screen. Measured on the next
+        # level it is wrong in both directions: cd82 level 2 has 139 informative
+        # pixels the level-0 mask excludes (the search is blind to 14% of the
+        # state), and vc33 level 1 has 1,779 clock-like pixels where level 0 had
+        # 494, so ~1,285 timer pixels get hashed into the key and it turns
+        # bijective again - the exact failure the mask was introduced to fix,
+        # reappearing at every level past the first. Probing costs ~600
+        # simulated actions, well under a second, and zero graded actions.
+        cell = calibrate(root, seed=seed + level)
+        ex.cell = cell
+        if verbose:
+            print(
+                f"  recalibrated for L{level}: {cell.n_informative} informative px "
+                f"({cell.n_varying} varying, {cell.n_clock} clock/HUD discarded)"
+            )
 
     est = game_score(baselines, per_level)
     return GameSolution(
