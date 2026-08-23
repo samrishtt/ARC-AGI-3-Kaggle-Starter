@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-NB = REPO / "1.33 scored in arc agi 3 competiotn in kaggle" / "arc3-duck-v13-priors.ipynb"
+NB = REPO / "1.33 scored in arc agi 3 competiotn in kaggle" / "arc3-duck-v14-recovery.ipynb"
 
 
 def main() -> int:
@@ -78,9 +78,35 @@ def main() -> int:
         if any(bad):
             problems.append("addendum contains escaped sequences that should have been resolved")
         # Needles must be written exactly as they appear, markdown emphasis included.
-        for want in ("*cover* predicate", "segmentation hash", "squared", "costs exactly zero"):
+        for want in (
+            "*cover* predicate",
+            "segmentation hash",
+            "squared",
+            "costs exactly zero",
+            "RESET costs ONE action",
+            "up, down, left, right",
+        ):
             if want not in addendum:
                 problems.append(f"addendum lost the phrase {want!r}")
+
+    # 3c. the recovery arming block: order is load-bearing, so check it explicitly.
+    # Arming recovery before killing R2 is the 0.82 configuration from the log.
+    flags_src = dict(code)[flags_at] if flags_at is not None else ""
+    kill_at = flags_src.find("PROBE_MAX_ACTIONS = 0")
+    arm_at = flags_src.find('GRAFT_FLAGS["recovery"] = True')
+    install_at = flags_src.find("install(bm, flags=GRAFT_FLAGS)")
+    print(f"[3c] recovery: kill R2 @{kill_at}  arm @{arm_at}  install @{install_at}")
+    if -1 in (kill_at, arm_at, install_at):
+        problems.append("recovery arming block is incomplete")
+    elif not kill_at < arm_at < install_at:
+        problems.append(f"recovery armed out of order: {kill_at} < {arm_at} < {install_at} is false")
+    if "recovery" in flags_src and '"recovery": True' in flags_src.split("try:")[0]:
+        problems.append("recovery is armed unconditionally in the literal dict — must be gated on the R2 kill")
+
+    # 3d. the efficiency rider must stay silent when the stock note is empty.
+    rider_src = dict(code)[graft_at] if graft_at is not None else ""
+    if "if note else note" not in rider_src:
+        problems.append("efficiency rider does not preserve the stock empty-note path")
 
     # the JSONL newline in the probe writer is the one escape most likely to break
     if graft_at is not None:

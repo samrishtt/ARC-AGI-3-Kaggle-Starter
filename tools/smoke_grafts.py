@@ -38,11 +38,12 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-NB = REPO / "1.33 scored in arc agi 3 competiotn in kaggle" / "arc3-duck-v13-priors.ipynb"
+NB = REPO / "1.33 scored in arc agi 3 competiotn in kaggle" / "arc3-duck-v14-recovery.ipynb"
 BUNDLE = REPO / "scratch" / "archive2_extracted" / "src"
 
 sys.path.insert(0, str(BUNDLE / "tufa-arc-agi-framework" / "src"))
 sys.path.insert(0, str(BUNDLE / "ARC3-Inference"))
+sys.path.insert(0, str(BUNDLE / "taaf-grafts"))
 
 # taaf.__init__ eagerly imports taaf.diagnostics, which pulls in plotting/stats
 # packages this box does not have. They are only used to *render* diagnostics, which
@@ -98,6 +99,7 @@ def graft_cell_source() -> str:
 def main() -> int:
     tg = _import_with_stubs("taaf.game")
     tool_agent = _import_with_stubs("inference.agent.tool_agent")
+    agent_ext = _import_with_stubs("taaf_grafts.agent_ext")
 
     stock_prompt_len = len(tool_agent._build_system_prompt(tool_output_tokens=4096))
     stock_finish = tg.Game.finish_game
@@ -193,12 +195,50 @@ def main() -> int:
         print(f"[A] row 0: {json.dumps(rows[0], sort_keys=True)}")
         print(f"[A] row 1 baselines: {rows[1]['base_actions_per_level']} (None = framework fallback)")
 
+    # --- Graft D: the rider rides, and only when the stock note speaks -----------
+    # Non-empty case: 100 actions against a baseline of 20 is over budget, so stock
+    # emits header + budget line + commit reminder.
+    loud = dict(level_number=0, actions_this_level=100, baseline_this_level=20, net_zero_actions=None)
+    quiet = dict(level_number=0, actions_this_level=0, baseline_this_level=20, net_zero_actions=None)
+    rider = ns["EFFICIENCY_NOTE_RIDER"]
+    note_loud = agent_ext.build_efficiency_note(**loud)
+    note_quiet = agent_ext.build_efficiency_note(**quiet)
+    print(f"[D] note when over budget: {len(note_loud)} chars, rider present={rider in note_loud}")
+    print(f"[D] note when nothing to report: {len(note_quiet)} chars (stock stays silent)")
+    if rider not in note_loud:
+        problems.append("efficiency rider missing from a non-empty note")
+    if not note_loud.startswith("EFFICIENCY BUDGET"):
+        problems.append("rider clobbered the stock note instead of appending to it")
+    if note_quiet != "":
+        problems.append(f"rider broke the stock silent path: {note_quiet!r}")
+    ns["_install_efficiency_rider"]()
+    if agent_ext.build_efficiency_note(**loud) != note_loud:
+        problems.append("re-installing the efficiency rider duplicated the text")
+
+    # --- Graft C: R2 dies, R1/R3 live -------------------------------------------
+    # This is the graft where a half-failure is worse than not doing it at all: a
+    # live R2 with recovery armed is precisely the config that scored 0.82.
+    rec = _import_with_stubs("taaf_grafts.recovery")
+    buttons = ["ACTION1", "ACTION2", "ACTION6"]
+    stock_plan = rec.build_probe_plan(buttons)
+    rec.PROBE_MAX_ACTIONS = 0
+    killed_plan = rec.build_probe_plan(buttons)
+    print(f"[C] probe plan: {len(stock_plan)} actions at stock, {len(killed_plan)} at PROBE_MAX_ACTIONS=0")
+    if not stock_plan:
+        problems.append("stock probe plan was already empty — the kill test proves nothing")
+    if killed_plan:
+        problems.append(f"R2 still plans {len(killed_plan)} actions at PROBE_MAX_ACTIONS=0")
+    # R1/R3 must not be collateral damage: both are reached without build_probe_plan.
+    for free_mechanism in ("REFRESH_LOCKIN_ACTS", "HANDOFF_MAX_CHARS", "WIPED_KNOWLEDGE_KEYS"):
+        if not hasattr(rec, free_mechanism):
+            problems.append(f"recovery is missing {free_mechanism} — R1/R3 may not be the mechanisms assumed")
+
     print()
     if problems:
         for p in problems:
             print(f"FAIL  {p}")
         return 1
-    print("OK  both grafts install and behave against the real shipped source")
+    print("OK  all four grafts install and behave against the real shipped source")
     return 0
 
 
