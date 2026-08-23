@@ -230,7 +230,11 @@ Two consequences, and they point in opposite directions:
   clearing. Spend actions to establish the mechanics: which button moves what, what
   blocks movement, what the objective is, what an action does when nothing appears
   to change. The first level also carries the smallest weight of any level in the
-  game.
+  game. But "cheap" here means cheap *relative to the later levels*: if the first
+  level turns out to be the only one you clear, then its efficiency is your entire
+  score for this game. So explore it freely while you still do not understand it,
+  and the moment you can see the objective, go and complete it rather than
+  continuing to explore for its own sake.
 - Being crisp pays on later levels. Once you know the mechanics, execute. Later
   levels carry more weight and charge every wasted action quadratically, and you
   should re-derive nothing you already established earlier in the same game - the
