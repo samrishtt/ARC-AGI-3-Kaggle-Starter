@@ -42,12 +42,27 @@ from __future__ import annotations
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from math import gcd
+from typing import Iterable
 
 import numpy as np
 
 from arc3x.percept import Move, background, mask_component, moved_objects
 
 MAX_STEP = 16  # a step, not a teleport; anything bigger is a mismatched object
+
+# The one cross-game regularity measured so far: which compass direction each
+# movement button means. Unit vectors only - the step length is whatever the game
+# turns out to use. Measured over the 25 dev games in
+# ``arc3x/why_no_transfer.py``, counting only games that offer the button and
+# move under it: ACTION1 north 90% (9/10), ACTION2 south 92% (12/13), ACTION3
+# west 100% (8/8), ACTION4 east 92% (11/12). ACTION5 is excluded on purpose - it
+# is the use button and agrees only 50% of the time, so there is no convention to
+# have. See ``Mechanics._convention`` for the two guards that keep this a prior.
+CONVENTION: dict[int, tuple[int, int]] = {1: (-1, 0), 2: (1, 0), 3: (0, -1), 4: (0, 1)}
+
+
+def _sign(v: int) -> int:
+    return (v > 0) - (v < 0)
 
 
 @dataclass
@@ -63,6 +78,10 @@ class Mechanics:
     body: set[int] = field(default_factory=set)
     # action id -> (dy, dx) of the controlled object
     deltas: dict[int, tuple[int, int]] = field(default_factory=dict)
+    # Buttons whose delta was filled in from the cross-game convention rather
+    # than observed directly. Kept separate so a caller can tell a measurement
+    # from an assumption, and so ``summary`` can show which is which.
+    assumed: set[int] = field(default_factory=set)
     # action id -> how many times pressing it changed nothing at all
     noop: Counter = field(default_factory=Counter)
     tries: Counter = field(default_factory=Counter)
@@ -113,31 +132,7 @@ class Mechanics:
             if abs(m.dy) > MAX_STEP or abs(m.dx) > MAX_STEP:
                 continue
             self.votes[(action, m.color, m.delta)] += 1
-        # What did we just walk onto? Sampled from the sprite's real footprint in
-        # its new position, read off the *previous* frame. This is the only
-        # observation that makes passable-only planning possible, so it has to be
-        # exact: guessing a sqrt(size) square around a two-colour sprite reads
-        # the wrong cells and teaches the model that the floor is a wall.
-        entered: set[int] = set()
-        if self.avatar >= 0:
-            # The best possible hint is the arrival position of the thing we just
-            # watched move. "That moved, so that is me" needs no deduction.
-            hint = self.pos
-            for m in mv:
-                if m.color == self.avatar and m.moved:
-                    hint = (m.top + m.dy, m.left + m.dx)
-                    break
-            box = self.locate(after, hint=hint)
-            if box is not None:
-                if box[:2] != self.pos:
-                    entered = self._under(before, after, box)
-                    if self.pos is not None:
-                        self.shifts[action] += 1
-                self.pos = (box[0], box[1])
-        for c in entered:
-            # Without this, one refusal would condemn a colour permanently and a
-            # door that opened would stay shut in the model forever.
-            self.passable[c] += 1
+        entered = self._track(action, before, after, mv, died=died)
         for m in van:
             if m.color != self.background:
                 self.vanished[m.color] += 1
@@ -150,6 +145,68 @@ class Mechanics:
             for c in entered:
                 if c != self.background:
                     self.goal_colors[c] += 2
+        return mv
+
+    def _track(
+        self,
+        action: int,
+        before: np.ndarray,
+        after: np.ndarray,
+        mv: list[Move],
+        *,
+        died: bool = False,
+    ) -> set[int]:
+        """Follow the sprite through one transition; record what it stood on.
+
+        Split out of ``observe`` because it needs the one thing ``observe`` does
+        not have while it is folding a batch: **a known avatar.** ``settle`` is
+        what establishes one, and it runs *after* the batch, so on a first pass
+        over a game's history ``self.avatar`` is -1 throughout and every
+        observation below is skipped. Measured consequence, across all 25 dev
+        games: ``shifts`` and ``blocking`` came out zero on every button of every
+        game, ``passable`` stayed empty, ``walk_mask`` fell back to its all-ones
+        fallback so ``_free`` was true everywhere, and the held-out misses were
+        100% "walked through a wall in imagination" with not one instance of the
+        opposite error. ``replay_geometry`` is the second pass that fixes it.
+
+        Note what decides "the sprite did not move" here: the *located sprite*,
+        not ``(before != after).any()``. Those differ on nearly every game,
+        because almost every board has a HUD that ticks on every single action -
+        ls20 changes 2 pixels in rows 61-62, s5i5 changes 1 pixel on all 175
+        actions - so a whole-grid comparison calls a refused move "eventful" and
+        never blames the obstacle. Comparing positions ignores chrome for free.
+        """
+        entered: set[int] = set()
+        if self.avatar < 0:
+            return entered
+        # The best possible hint is the arrival position of the thing we just
+        # watched move. "That moved, so that is me" needs no deduction.
+        hint = self.pos
+        for m in mv:
+            if m.color == self.avatar and m.moved:
+                hint = (m.top + m.dy, m.left + m.dx)
+                break
+        box = self.locate(after, hint=hint)
+        if box is None:
+            return entered
+        if box[:2] != self.pos:
+            # What did we just walk onto? Sampled from the sprite's real footprint
+            # in its new position, read off the *previous* frame. This is the only
+            # observation that makes passable-only planning possible, so it has to
+            # be exact: guessing a sqrt(size) square around a two-colour sprite
+            # reads the wrong cells and teaches the model that the floor is a wall.
+            entered = self._under(before, after, box)
+            if self.pos is not None:
+                self.shifts[action] += 1
+            self.pos = (box[0], box[1])
+        elif self.pos is not None:
+            # Same place as before: the press was refused, whatever else on the
+            # board changed. The cells it tried to sweep into are the obstacle.
+            self._blame_block(before, action)
+        for c in entered:
+            # Without this, one refusal would condemn a colour permanently and a
+            # door that opened would stay shut in the model forever.
+            self.passable[c] += 1
         if died:
             # Only *novel* ground gets blamed for a death. A footprint spans
             # several cells, so the fatal step also lands on ordinary floor, and
@@ -158,7 +215,36 @@ class Mechanics:
             for c in entered:
                 if self.passable.get(c, 0) < 3:
                     self.fatal[c] += 1
-        return mv
+        return entered
+
+    def replay_geometry(
+        self, steps: Iterable[tuple[int, np.ndarray, np.ndarray]]
+    ) -> int:
+        """Second pass over history: now that we know who we are, learn what stops us.
+
+        Pass one answers "which blob is me and which way does each button push
+        me", and needs no notion of walls. Pass two answers "what can I stand on",
+        and cannot start until pass one has finished. That is the order a person
+        learns a board in too: you find yourself first, and only then does
+        bumping into something mean anything.
+
+        The two passes record disjoint facts - this one touches ``passable``,
+        ``blocking``, ``shifts``, ``fatal`` and ``pos``, never ``votes`` or
+        ``tries`` - so replaying the same transitions cannot double-count the
+        evidence that chose the avatar. Costs one ``locate`` per transition and no
+        real actions, because it is a re-read of history the framework already
+        wrote.
+        """
+        if self.avatar < 0:
+            return 0
+        self.pos = None
+        n = 0
+        for action, before, after in steps:
+            if before.shape != after.shape:
+                continue
+            self._track(action, before, after, [], died=False)
+            n += 1
+        return n
 
     def _under(
         self, before: np.ndarray, after: np.ndarray, box: tuple[int, int, int, int]
@@ -177,7 +263,23 @@ class Mechanics:
 
     def _blame_block(self, frame: np.ndarray, action: int) -> None:
         """A refused move names its own obstacle: whatever occupies the cells
-        the sprite's footprint would have swept into."""
+        the sprite's footprint would have swept into.
+
+        One vote per colour per refusal, **not one per pixel.** ``passable``
+        counts once per move, so per-pixel blame puts the two counters on
+        different scales and a sprite six pixels wide casts six wall votes
+        against one floor vote for the very same colour. ``blocked_set`` then
+        condemns whatever the sprite has been walking on all along - measured, the
+        walkable mask collapsed to 4% of the board on sp80 and re86 and 1% on
+        r11l, and every held-out miss became "predicted a wall that was not
+        there": 42, 73 and 53 of them with not one error the other way.
+
+        This matters beyond the units, because a refusal does not always *have* a
+        spatial cause. A game that ignores input while an animation plays, or that
+        wants a key first, refuses a move whose destination is ordinary floor.
+        Charging that floor once, and letting the many times we stood on it
+        outvote the charge, is what keeps one such refusal from closing the board.
+        """
         d = self.deltas.get(action)
         if d is None or self.avatar < 0:
             return
@@ -191,7 +293,7 @@ class Mechanics:
         H, W = frame.shape
         body = self.body or {self.avatar}
         ys, xs = np.nonzero(foot)
-        hit = False
+        obstacles: set[int] = set()
         for y, x in zip(ys.tolist(), xs.tolist()):
             ny, nx = top + y + dy, left + x + dx
             if not (0 <= ny < H and 0 <= nx < W):
@@ -203,33 +305,113 @@ class Mechanics:
             c = int(frame[ny, nx])
             if c in body:
                 continue
+            obstacles.add(c)
+        for c in obstacles:
             self.blocking[c] += 1
-            hit = True
-        if not hit:
-            return
 
     # -- consensus ---------------------------------------------------------
+
+    def _step(self, c: int, min_votes: int = 2) -> int:
+        """The one step size this colour moves in, or 0 if there is no clear one.
+
+        A game has a grid and the avatar moves a whole cell at a time, so *every*
+        button displaces it by the same magnitude. That makes the step size a
+        global property of the game rather than of a button, and any vote whose
+        magnitude disagrees with it is an artifact.
+
+        Which matters because of a measured failure. On ``wa30`` the sprite turns
+        to face the way it is walking, so the *first* press of each new direction
+        both turns and steps, and the ink inside the cell shifts to the other end
+        of it. The true step is 4 in all four directions; the first press of each
+        direction reads as 7 or 3::
+
+            act1 p0  d=(-4,+0)      act2 p0  d=(+7,+0)   <- turn, artifact
+            act1 p1  d=(-4,+0)      act2 p1  d=(+4,+0)
+            act1 p2  d=(+0,+0)      act2 p2  d=(+4,+0)
+
+        Judging each button on its own votes, that artifact can win - and then it
+        sets the ruler that every *other* button is measured against, so the
+        remaining two directions get thrown out for not fitting it. Measured:
+        ``moves`` came out ``{2: (7,0), 4: (0,7)}`` on a game with four working
+        buttons and a step of 4.
+
+        Ties go to the smaller magnitude, because a turn-and-step adds the
+        sprite's own offset within the cell to the cell step, so the artifacts are
+        usually the larger number.
+
+        Returns 0 - meaning "no usable lattice, fall back to plain vote counting"
+        - unless the modal magnitude is corroborated across at least two different
+        buttons. A step size derived from a single sighting would just be that
+        sighting justifying itself, which is exactly the coincidental shape match
+        that ``min_votes`` exists to reject.
+        """
+        mag: Counter = Counter()
+        acts: dict[int, set[int]] = {}
+        for (a, cc, d), n in self.votes.items():
+            if cc != c or d == (0, 0):
+                continue
+            for v in d:
+                if v:
+                    mag[abs(v)] += n
+                    acts.setdefault(abs(v), set()).add(a)
+        if not mag:
+            return 0
+        top = max(mag.values())
+        s = min(m for m, k in mag.items() if k == top)
+        # s == 1 is a lattice that admits every possible delta, so it carries no
+        # information and must not be allowed to lower the evidence bar.
+        if s < 2 or mag[s] < min_votes or len(acts[s]) < 2:
+            return 0
+        return s
+
+    @staticmethod
+    def _on_lattice(d: tuple[int, int], s: int) -> bool:
+        """Is this displacement a whole number of cells? Multiples, not just one.
+
+        A button that jumps two cells is as real as one that walks a single cell,
+        so the test is divisibility rather than equality.
+        """
+        return s >= 2 and any(d) and all(v % s == 0 for v in d)
 
     def settle(self, min_votes: int = 2) -> None:
         """Turn the raw votes into a believed avatar and a delta per action.
 
-        Two filters do the work. First, the background is never a candidate.
+        Three filters do the work. First, the background is never a candidate.
         Second, a candidate is scored on *reversibility*: a real movement scheme
         contains opposite pairs, so a colour whose deltas include (dy,dx) and
         (-dy,-dx) under different actions is almost certainly the thing being
         steered, while a coincidental shape match almost never is.
+
+        Third, and only where the game has shown one, the *lattice*: a
+        displacement that is a whole number of cells beats one that is not, no
+        matter how the vote counts fall, and needs only a single clean sighting.
+        See ``_step`` for the measured failure that filter exists for.
         """
+        raw: dict[int, dict[int, list[tuple[tuple[int, int], int]]]] = {}
+        for (a, c, d), n in self.votes.items():
+            if c == self.background:
+                continue
+            raw.setdefault(c, {}).setdefault(a, []).append((d, n))
+
         by_color: dict[int, dict[int, tuple[int, int]]] = {}
         strength: Counter = Counter()
-        for (a, c, d), n in self.votes.items():
-            if n < min_votes or c == self.background:
-                continue
-            cur = by_color.setdefault(c, {})
-            # keep the most-voted delta for this (colour, action)
-            best = self.votes[(a, c, cur[a])] if a in cur else -1
-            if n > best:
-                cur[a] = d
-            strength[c] += n
+        for c, per_action in raw.items():
+            s = self._step(c, min_votes)
+            for a, cands in per_action.items():
+                on = [(d, n) for d, n in cands if self._on_lattice(d, s)]
+                # On the lattice, one sighting is enough - the lattice itself is
+                # the corroboration, and it was built from other buttons. Off it,
+                # the usual threshold applies, so a game with no clear grid keeps
+                # exactly the old behaviour.
+                pool = [(d, n) for d, n in (on or cands) if n >= (1 if on else min_votes)]
+                if not pool:
+                    continue
+                # Most votes wins; a tie goes to the shorter displacement, which
+                # is the one more likely to be a plain step rather than a step
+                # plus a turn.
+                d, n = max(pool, key=lambda kv: (kv[1], -abs(kv[0][0]) - abs(kv[0][1])))
+                by_color.setdefault(c, {})[a] = d
+                strength[c] += n
         if not by_color:
             return
 
@@ -255,6 +437,58 @@ class Mechanics:
             shared = set(ds) & set(self.deltas)
             if len(shared) >= 2 and all(ds[a] == self.deltas[a] for a in shared):
                 self.body.add(c)
+        # Last, and only where the evidence already agrees with it, the protocol
+        # prior. Placed after body detection so an assumed delta can never pull a
+        # colour into the sprite.
+        self._convention()
+
+    def _convention(self) -> None:
+        """Fill a button whose motion was *seen but not parsed*, using the protocol.
+
+        ``arc3x/why_no_transfer.py`` pressed every declared button on all 25 dev
+        games and read off what ``settle`` concluded. The wire ids turn out to
+        carry a shared convention: of the games that move under each button,
+        ACTION1 goes north in 90%, ACTION2 south in 92%, ACTION3 west in 100%,
+        ACTION4 east in 92%. That is a fact about the competition's action
+        protocol, not about any one game, and it is the one thing measured so far
+        that transfers - a policy distilled from the same 25 games scored 1.10x
+        random on unseen ones, flat across a 3x range of training data.
+
+        Two guards keep this a prior rather than a hardcoding:
+
+        * It only fires for a button where ``shifts`` is positive and no delta was
+          parsed - the avatar was *seen to move* under it and the displacement
+          could not be read. That is the rotating-sprite case: ``moved_objects``
+          demands a rigid shift, so a sprite that turns to face its direction of
+          travel matches itself on neither of the two axes it is not facing, and
+          wa30 and sc25 hand the planner two directions out of four. It cannot
+          fire for a dead button, and it cannot fire for a use button, because
+          neither ever shifts the avatar.
+        * It requires every already-observed movement button to agree with the
+          convention. tu93 inverts it - ACTION1 goes south, ACTION2 north - and
+          there the disagreement blocks every fill. Evidence beats the prior, so
+          the 8% of games that break the convention lose nothing.
+
+        The step length is the game's own ``tile``, never assumed: the convention
+        supplies a direction, the game supplies how far.
+        """
+        if self.avatar < 0 or not self.deltas:
+            return
+        t = self.tile
+        if t <= 0:
+            return
+        seen = [(a, d) for a, d in self.deltas.items() if a in CONVENTION and d != (0, 0)]
+        if not seen:
+            return
+        for a, d in seen:
+            uy, ux = CONVENTION[a]
+            if (_sign(d[0]), _sign(d[1])) != (uy, ux):
+                return  # this game does not follow the convention; assume nothing
+        for a, (uy, ux) in CONVENTION.items():
+            if a in self.deltas or self.shifts.get(a, 0) <= 0:
+                continue
+            self.deltas[a] = (uy * t, ux * t)
+            self.assumed.add(a)
 
     def _fill_deltas(self) -> None:
         """Second pass: accept single-observation deltas for the believed avatar.
@@ -270,20 +504,32 @@ class Mechanics:
         is enough - provided it fits the scheme we already believe. A single
         stray shape-match is rejected because a real movement scheme has
         consistent step sizes and opposite pairs; a coincidence has neither.
+
+        "The scheme we already believe" is the game's lattice when it has one, and
+        only the deltas that happen to have settled otherwise. That distinction is
+        the whole fix: measuring a candidate against the *already accepted* deltas
+        is order-dependent, so one artifact that settles early condemns every real
+        button after it.
         """
         if self.avatar < 0:
             return
         known = set(self.deltas.values())
         if not known:
             return
+        s = self._step(self.avatar)
         mags = {abs(v) for dy, dx in known for v in (dy, dx) if v}
         for (a, c, d), n in self.votes.items():
             if c != self.avatar or a in self.deltas or d == (0, 0):
                 continue
             dy, dx = d
+            if s and not self._on_lattice(d, s):
+                # The game has shown its grid and this is not on it. Off-lattice
+                # deltas are the turn-and-step artifact, and accepting one here
+                # was worth two wrong buttons on a measured game.
+                continue
             fits_pair = (-dy, -dx) in known
             fits_step = all(abs(v) in mags for v in (dy, dx) if v)
-            if fits_pair or fits_step:
+            if s or fits_pair or fits_step:
                 self.deltas[a] = d
 
     @property
