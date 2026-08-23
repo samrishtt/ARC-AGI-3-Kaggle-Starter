@@ -247,7 +247,11 @@ Two known defects, both measured:
 - Buttons that change the board *without* moving the avatar were discarded as
   no-ops. Twelve of 25 games have such a button (a use / grab / select / rotate);
   two games have *nothing else* — five and four working buttons respectively, all
-  invisible to the planner. Now exposed as `Mechanics.acts`; not yet used.
+  invisible to the planner. Now exposed as `Mechanics.acts` and used in two
+  places: `act_round` ([agent.py:580](agent.py#L580)) presses each one at most
+  once, ordered by how often it has been seen to do anything, and
+  `push_frontier` ([agent.py:718](agent.py#L718)) tries them against a blocking
+  colour after shoving it fails — *walk there, then press use*.
 
 ### 3.3 `progress.py` — `Progress`, an objective with no labels
 

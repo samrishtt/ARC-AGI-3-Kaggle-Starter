@@ -183,9 +183,11 @@ change history rather than one frame, so it is deliberately separate.
 silently discards every button that changes the board without moving the avatar — a
 use, grab, drop, select or rotate. **Twelve of 25 dev games have one, and two games
 have nothing else**: five working buttons and four working buttons respectively,
-all invisible to the planner. They are now exposed as `Mechanics.acts`; nothing
-uses them. The general capability needed is *walk there, then press use* — extend
-the frontier walk, keeping any press that moves the ratchet.
+all invisible to the planner. They are now exposed as `Mechanics.acts` and this
+item is **done**: `act_round` (agent.py:580) presses each act button at most once,
+ordered by how often it has worked, and `push_frontier` (agent.py:718) tries them
+against a blocking colour once shoving it has failed — the *walk there, then press
+use* capability, keeping any press that moves the ratchet.
 
 *Press-and-see for the two avatar-less games has been **retracted**.* Reading
 `cd82.py` in full (782 lines) on 2026-08-23 showed it is a **paint-the-canvas**

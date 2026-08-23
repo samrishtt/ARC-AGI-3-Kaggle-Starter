@@ -133,10 +133,12 @@ the leaderboard.
 
 ## 3. Still open from the previous queue
 
-- **ACT buttons plannable.** `Mechanics.acts` exposes buttons that change the board
-  without moving the avatar; `Mechanics.moves` filtered `d != (0,0)` and threw all
-  of them away. 12 of 25 games have one; `cd82` and `tr87` have **nothing else**
-  (`planner-sees=[]`). The general capability is *walk there then press use*.
+- ~~**ACT buttons plannable.**~~ **Done.** `Mechanics.acts` exposes buttons that
+  change the board without moving the avatar; `Mechanics.moves` filtered
+  `d != (0,0)` and threw all of them away. 12 of 25 games have one; `cd82` and
+  `tr87` have **nothing else** (`planner-sees=[]`). Both consumers now exist:
+  `act_round` (agent.py:580) and the use-branch of `push_frontier`
+  (agent.py:718), which is *walk there then press use*.
   ~~*press-and-see* in frame space for the two avatar-less games~~ — **retracted
   2026-08-23 after reading `cd82.py` in full (782 lines).** cd82 is not a
   press-and-see game, it is a *paint-the-canvas* game, and press-and-see would
