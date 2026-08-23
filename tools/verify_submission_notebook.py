@@ -1,6 +1,6 @@
 """Verify the generated notebook before a nine-hour run depends on it.
 
-Four checks, each of which has a plausible way to fail that a human read-through
+Five checks, each of which has a plausible way to fail that a human read-through
 would miss:
 
   1. **Every code cell compiles.** The graft cell is ~200 lines of Python embedded in
@@ -15,6 +15,11 @@ would miss:
      because a mangled ``\\n`` would silently become a literal backslash-n in the
      model's system prompt.
   4. **No outputs.** A stale traceback shipped to Kaggle reads as a real failure.
+  5. **The bundle loader is contents-based.** Picking the first ``rglob`` hit cost the
+     2026-08-23 run every graft, silently, for 2h12m.
+
+Defaults to the v15 notebook. Pass a path to check a different one; v14 is expected
+to fail check 5, since it is the notebook that shipped that bug.
 
 Run:
     .venv/Scripts/python.exe tools/verify_submission_notebook.py
@@ -22,16 +27,32 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-NB = REPO / "1.33 scored in arc agi 3 competiotn in kaggle" / "arc3-duck-v14-recovery.ipynb"
+NB_DIR = REPO / "1.33 scored in arc agi 3 competiotn in kaggle"
+
+# Default to the notebook that actually ships. This file was pinned to v14 while v15
+# was the upload candidate, so its four checks had never run against the file being
+# submitted - which is the one way a verifier can fail silently.
+DEFAULT_NB = NB_DIR / "arc3-duck-v15-clickspace.ipynb"
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("notebook", nargs="?", default=str(DEFAULT_NB))
+    args = ap.parse_args()
+    NB = Path(args.notebook)
+    if not NB.is_absolute():
+        NB = NB_DIR / NB.name if (NB_DIR / NB.name).exists() else NB
+    if not NB.exists():
+        print(f"FAIL  no such notebook: {NB}")
+        return 1
+    print(f"verifying {NB.name}\n")
     nb = json.loads(NB.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code = [(i, "".join(c["source"])) for i, c in enumerate(cells) if c.get("cell_type") == "code"]
@@ -85,6 +106,21 @@ def main() -> int:
             "costs exactly zero",
             "RESET costs ONE action",
             "up, down, left, right",
+            # Section 5, added in v15. The last two are the corrected conclusion: an
+            # earlier draft told the agent that agreeing frames mean the coordinate is
+            # decoration, which the exhaustive 4096-cell sweep refuted (tn36 has 11
+            # distinct outcomes at 96% modal). If these phrases vanish, the wrong
+            # advice is back. None may span a line break - the prior is hard-wrapped.
+            "what the coordinate is worth",
+            "evidence at all that there is nothing to find",
+            "must not hunt for them by sampling the board evenly",
+            # Section 6, added in v15: the two costs of a batch, both read out of
+            # Solver.step_env. The run is clock-bound (all four games in the harvested
+            # log were cut at wallclock_s 7920.2), so batching is the lever on actions -
+            # but the loop does not break on an unchanged board and only the last frame
+            # is returned, and the model cannot see either fact from inside.
+            "Only the last board comes back",
+            "does not stop when the board stops responding",
         ):
             if want not in addendum:
                 problems.append(f"addendum lost the phrase {want!r}")
@@ -120,6 +156,24 @@ def main() -> int:
     print(f"[4] code cells carrying outputs: {len(dirty)}")
     if dirty:
         problems.append(f"cells still carry outputs: {dirty}")
+
+    # 5. the bundle loader must not pick the first filesystem hit.
+    #
+    # On 2026-08-23 it did, two attached datasets carried the marker, and the one
+    # WITHOUT src/taaf-grafts won. Every graft plus the recovery layer was silently
+    # discarded and the run played stock for 2h12m. rglob order is filesystem order,
+    # so a rerun could not have reproduced it. v14 fails this check on purpose - it
+    # is the notebook that shipped the bug.
+    blob = "\n".join(src for _, src in code)
+    if 'for marker in Path("/kaggle/input").rglob' in blob:
+        problems.append(
+            "bundle loader still returns the first rglob hit - this is the bug that cost "
+            "the 2026-08-23 run every graft"
+        )
+    has_pref = "with_grafts" in blob and "sorted(Path(\"/kaggle/input\").rglob" in blob
+    print(f"[5] bundle loader prefers the graft-bearing bundle: {has_pref}")
+    if not has_pref:
+        problems.append("bundle loader does not prefer the bundle containing src/taaf-grafts")
 
     print()
     if problems:
