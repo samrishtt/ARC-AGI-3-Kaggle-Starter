@@ -65,6 +65,7 @@ replayed for a better score - the only way to get a second chance at one.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -171,6 +172,11 @@ class GradedRun:
     levels_completed: int = 0
     actions_by_level: list[tuple[int, int]] = field(default_factory=list)
     state: str = "NOT_PLAYED"
+    # level -> what the agent tried there and how each attempt ended. The mean
+    # score says a game failed; this says *how*, which is the difference between
+    # "the planner had no destination" and "it had one and could not reach it".
+    # Those two need opposite fixes and the mean cannot tell them apart.
+    notes: dict[int, Counter] = field(default_factory=dict)
     _twin: Any = None
     _game: Any = None
     _baselines: list[int] = field(default_factory=list)
@@ -234,6 +240,23 @@ class GradedRun:
                 print(f"    level {obs.levels_completed} at action {self.actions}")
         self.levels_completed = obs.levels_completed
 
+    # -- diagnostics -------------------------------------------------------
+
+    def note(self, reason: str, level: int | None = None) -> None:
+        """Record how one attempt ended, against the level it was spent on.
+
+        ``level`` is the level the attempt *started* on, which is not always the
+        current one: the attempt that clears a level advances the counter before
+        the note is written, and filing "cover completed a level" under the level
+        it moved us *to* points the blame at exactly the wrong place.
+
+        This is the only channel out of an agent, because ``agent_fn`` returns
+        nothing and the score alone cannot distinguish a game the agent never
+        understood from one it understood and could not execute.
+        """
+        lvl = self.levels_completed if level is None else int(level)
+        self.notes.setdefault(lvl, Counter())[reason] += 1
+
     # -- results -----------------------------------------------------------
 
     @property
@@ -257,10 +280,48 @@ class GradedRun:
             "level_scores": [round(s, 2) for s in per],
             "level_actions": charged,
             "baselines": base,
+            # Plain dicts so the whole report survives a process boundary.
+            "notes": {lvl: dict(c) for lvl, c in sorted(self.notes.items())},
+            # Where the run died, and what it cost. The level that ate the budget
+            # is the one worth fixing; every other level is noise.
+            "stalled_on": self.levels_completed,
+            "stall_cost": charged[self.levels_completed]
+            if self.levels_completed < len(charged)
+            else 0,
         }
 
 
 # -- suite ------------------------------------------------------------------
+
+
+def _play_one(job: tuple) -> dict:
+    """One game, start to finish, in whatever process picks it up.
+
+    The ``GradedRun`` is built *here* rather than passed in: it holds a live
+    engine object that has no business crossing a process boundary. Only the
+    game id, the env path and the finished report ever travel.
+    """
+    gid, env_dir, agent_fn, agent_kw = job
+    run = GradedRun(gid, env_dir)
+    try:
+        agent_fn(run, **agent_kw)
+    except Exception as exc:  # one broken game must not sink the suite
+        run.note(f"crash:{type(exc).__name__}")
+    rep = run.report()
+    return rep
+
+
+def _line(rep: dict) -> str:
+    """One game's result, with the reason it stopped where it did."""
+    notes = rep.get("notes", {})
+    stall = notes.get(rep.get("stalled_on", 0), {})
+    why = ",".join(f"{k}x{v}" for k, v in sorted(stall.items(), key=lambda kv: -kv[1])[:4])
+    return (
+        f"  {rep['game_id'].split('-')[0]:6s} {rep['levels_completed']}/{rep['n_levels']} "
+        f"levels  score {rep['score']:6.2f}  actions {rep['actions']:6d}  "
+        f"charged {rep['level_actions'][:4]} vs base {rep['baselines'][:4]}"
+        + (f"\n         stuck on L{rep['stalled_on']} for {rep['stall_cost']} actions: {why}" if why else "")
+    )
 
 
 def run_suite(
@@ -269,6 +330,7 @@ def run_suite(
     *,
     env_dir: Path | None = None,
     verbose: bool = True,
+    workers: int = 1,
     **agent_kw: Any,
 ) -> dict:
     """Play every game once with ``agent_fn(run, **kw)`` and average the scores.
@@ -276,27 +338,94 @@ def run_suite(
     The mean over games is what the leaderboard reports, so this returns the
     same statistic - computed on the development set, which is the closest
     honest proxy available for a private set of unseen games.
+
+    ``workers`` runs the games concurrently. Every game is fully independent -
+    its own ``Twin``, its own engine, no shared state and no writes - so this is
+    exact, not approximate. It matters because a serial pass over 25 games at a
+    3000-action budget takes the better part of an hour, and a measurement that
+    slow gets run once instead of after every change, which is how a regression
+    survives. Keep ``workers=1`` when a traceback matters more than the clock.
     """
     from arc3x.explore import discover_games
 
     env_dir = Path(env_dir) if env_dir else default_env_dir()
     ids = list(game_ids) if game_ids else discover_games(env_dir)
+    jobs = [(gid, env_dir, agent_fn, dict(agent_kw)) for gid in ids]
 
     reports: list[dict] = []
-    for gid in ids:
-        run = GradedRun(gid, env_dir)
-        try:
-            agent_fn(run, **agent_kw)
-        except Exception as exc:  # one broken game must not sink the suite
+    if workers > 1 and len(jobs) > 1:
+        import multiprocessing as mp
+        import os
+
+        # Set *before* the pool exists. With 'spawn' the child re-imports this
+        # module - and numpy with it - so the BLAS thread pool is sized at import
+        # time and an env var set inside the worker arrives too late. Without
+        # this, 6 workers each claim all 12 cores, 72 threads thrash over 12, and
+        # games slow by more than an order of magnitude: measured ls20 at 32
+        # actions in 60s where serial did 401. On 64x64 boards single-threaded
+        # numpy is the right choice anyway; the threading only ever cost us.
+        for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+            os.environ.setdefault(var, "1")
+
+        # 'spawn' on Windows re-imports this module in the child, so agent_fn has
+        # to be importable by name - a module-level function, not a lambda or a
+        # bound method. play_agent in arc3x.agent satisfies that.
+        with mp.get_context("spawn").Pool(min(workers, len(jobs))) as pool:
+            for rep in pool.imap_unordered(_play_one, jobs):
+                reports.append(rep)
+                if verbose:
+                    print(_line(rep), flush=True)
+        # imap_unordered returns in completion order; restore the caller's order
+        # so two runs are diffable line by line.
+        order = {gid: i for i, gid in enumerate(ids)}
+        reports.sort(key=lambda r: order.get(r["game_id"], 0))
+    else:
+        for job in jobs:
+            rep = _play_one(job)
+            reports.append(rep)
             if verbose:
-                print(f"  {gid}: {type(exc).__name__}: {exc}")
-        rep = run.report()
-        reports.append(rep)
-        if verbose:
-            print(
-                f"  {gid.split('-')[0]:6s} {rep['levels_completed']}/{rep['n_levels']} "
-                f"levels  score {rep['score']:6.2f}  actions {rep['actions']:6d}  "
-                f"charged {rep['level_actions'][:4]} vs base {rep['baselines'][:4]}"
-            )
+                print(_line(rep), flush=True)
+
     mean = sum(r["score"] for r in reports) / max(1, len(reports))
+    if verbose:
+        print(stall_summary(reports), flush=True)
     return {"mean_score": mean, "reports": reports}
+
+
+def stall_summary(reports: Sequence[dict]) -> str:
+    """Where the whole suite is losing, ranked.
+
+    Reports coverage out of the full set next to the mean, always. A mean of
+    0.142 over 25 games with 23 zeros in it reads like a small positive result
+    and is in fact one game working, so the count has to travel with the number.
+    """
+    n = len(reports)
+    cleared = Counter()
+    for r in reports:
+        cleared[r["levels_completed"]] += 1
+    reasons: Counter = Counter()
+    for r in reports:
+        for reason, k in r.get("notes", {}).get(r.get("stalled_on", 0), {}).items():
+            reasons[reason] += k
+    timed = [
+        r["game_id"].split("-")[0]
+        for r in reports
+        if any("TIMEOUT" in c for c in r.get("notes", {}).values())
+    ]
+    lines = [
+        f"MEAN {sum(r['score'] for r in reports) / max(1, n):.3f}   over {n} games",
+        "levels cleared:  " + "  ".join(f"{k} lvl x{v}" for k, v in sorted(cleared.items())),
+        f"  reached L1+: {sum(v for k, v in cleared.items() if k >= 1)}/{n}"
+        f"   reached L2+: {sum(v for k, v in cleared.items() if k >= 2)}/{n}",
+        "why the run stopped, summed over games: "
+        + ("  ".join(f"{k}={v}" for k, v in reasons.most_common(8)) or "(no notes)"),
+    ]
+    if timed:
+        # Loud, because this invalidates the comparison rather than degrading it.
+        lines.append(
+            f"!! {len(timed)} game(s) cut off by the WALL CLOCK, not the action "
+            f"budget: {timed}\n   this number is not comparable to another run - "
+            f"raise --seconds or lower --workers"
+        )
+    return "\n".join(lines)

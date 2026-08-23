@@ -80,6 +80,17 @@ class Agent:
     def spent(self) -> bool:
         return self.run.actions >= self.budget or time.perf_counter() > self.deadline
 
+    @property
+    def timed_out(self) -> bool:
+        """True when the clock stopped us rather than the action budget.
+
+        Kaggle bills actions, not seconds, so a run cut short by the wall clock
+        is not a measurement - it is a different, machine-dependent experiment,
+        and two such runs are not comparable. It has to be visible in the report
+        rather than silently averaged in.
+        """
+        return self.run.actions < self.budget and time.perf_counter() > self.deadline
+
     def act(self, aid: int, x: int = 0, y: int = 0) -> GObs:
         """One billed action, folded into the model and the novelty memory."""
         before = self.obs.frame if self.obs is not None else None
@@ -445,7 +456,14 @@ class Agent:
         while not self.spent and not (self.obs and self.obs.won):
             rounds += 1
             level_at_start = self.level
+            L = level_at_start
             steerable = self.m.avatar >= 0 and bool(self.m.moves)
+            # Recorded once per round, because "did this agent ever have a
+            # destination on this level" is the first question to ask of a zero
+            # and the score cannot answer it.
+            self.run.note("steer" if steerable else "nosteer", L)
+            if self.dream.objective(self.obs.frame) is None:
+                self.run.note("noobjective", L)
 
             if steerable:
                 # First ask the imagination. It is the only part of the agent that
@@ -453,6 +471,7 @@ class Agent:
                 # rather than "this cell looks interesting", so when it has an
                 # opinion it outranks every heuristic below.
                 out = self.imagine()
+                self.run.note(f"imagine:{out}", L)
                 if out in ("level", "win"):
                     continue
                 # A known goal colour means we can go straight there. This is
@@ -461,17 +480,22 @@ class Agent:
                 goal = {c for c, _ in self.m.goal_colors.most_common(3)}
                 if goal:
                     cells = self.goal_cells(self.obs.frame, goal)
-                    if cells and self.navigate(cells, max_actions=150) in (
-                        "level",
-                        "win",
-                    ):
-                        continue
-                if self.cover() in ("level", "win"):
+                    if cells:
+                        out = self.navigate(cells, max_actions=150)
+                        self.run.note(f"goal:{out}", L)
+                        if out in ("level", "win"):
+                            continue
+                out = self.cover()
+                self.run.note(f"cover:{out}", L)
+                if out in ("level", "win"):
                     continue
-                if self.push_frontier() in ("level", "win"):
+                out = self.push_frontier()
+                self.run.note(f"frontier:{out}", L)
+                if out in ("level", "win"):
                     continue
 
             if 6 in self.run._declared and self.click_round():
+                self.run.note("click:change", L)
                 continue
 
             if self.level != level_at_start:
@@ -481,6 +505,7 @@ class Agent:
             # evidence, wipe the memory of where we have been, and if that
             # still yields nothing, reset the level - one action - so the next
             # round starts from a pristine board rather than a stuck corner.
+            self.run.note("roundfail", L)
             self.m.settle(min_votes=1)
             self.visited.clear()
             self.tried_targets.clear()
@@ -489,6 +514,8 @@ class Agent:
                 self.flail(50)
             else:
                 self.obs = self.run.reset()
+        if self.timed_out:
+            self.run.note("TIMEOUT", self.level)
 
     def goal_cells(self, frame: np.ndarray, goal: set[int]) -> list[tuple[int, int]]:
         """Every pixel showing a colour that has previously ended a level."""
