@@ -1,74 +1,195 @@
-# Next session — queued 2026-08-22, for 2026-08-23
+# Next session — queued 2026-08-23
 
-State at commit `40a1d75`.
+State: uncommitted work on `codex/control-001-seed`, off commit `1944e2a`.
 
-## The number that governs everything
+## 0. Run these four things first, in this order
 
-`arc3x/graded.py run_suite` over all 25 dev games: **MEAN 0.142**, 2 levels
-completed, and **all 25 games burn the full 3000-action cap**. The Kaggle
-submission scores **2.14**. So arc3x does not ship as the agent. It is a
-measurement rig and a source of components for the notebook's Cell 8.
+**Nothing below §1 has executed.** The Bash tool's safety classifier was
+unavailable for essentially the whole 2026-08-23 session (one command in ~15 got
+through), so `relive.py`, the `agent.py` edits and `smoke_relive.py` have not even
+been import-checked. No claim is made for any of them.
 
-Only two games score at all, and they say what works:
+```bash
+# (a) does it even import
+PYTHONPATH=. .venv/Scripts/python.exe -c "import arc3x.agent, arc3x.relive, arc3x.smoke_relive; print('import ok')"
 
-| game | levels | score | actions to clear level 0 | human baseline |
-|------|--------|-------|--------------------------|----------------|
-| lp85 | 1/8    | 2.78  | 6                        | 17             |
-| ls20 | 1/7    | 0.78  | 47                       | 22             |
+# (b) is the mechanism doing what it says - 6 games, ~4 min, not a score measurement
+PYTHONPATH=. .venv/Scripts/python.exe arc3x/smoke_relive.py
 
-lp85 is a *click* game with no avatar and it beat the human baseline by 2.8x.
-That is the ratchet objective in `arc3x/progress.py` working.
+# (c) is max-pooling the right coarsening, or did we just assume it
+PYTHONPATH=. .venv/Scripts/python.exe arc3x/why_cells.py --steps 200
 
-## 1. Make ACT buttons plannable
+# (d) the only thing allowed to make a claim about score
+PYTHONPATH=. .venv/Scripts/python.exe arc3x/suite.py --split both -w 10 --budget 3000 > scratch/suite_relive.log
 
-`Mechanics.acts` (new) exposes buttons that change the board without moving the
-avatar. `Mechanics.moves` filters `d != (0,0)` and threw all of them away.
+# (e) the objective-detector claim - INDEPENDENT of relive, run it even if (a) fails
+PYTHONPATH=. .venv/Scripts/python.exe arc3x/why_markers.py --steps 400
+```
 
-    12 of 25 games have one
-    cd82  1:ACT(1px) 2:ACT(1px) 3:ACT(200px) 4:ACT(200px) 5:ACT(13px)  planner-sees=[]
-    tr87  1:ACT(13px) 2:ACT(14px) 3:ACT(28px) 4:ACT(29px)              planner-sees=[]
+(e) touches none of `relive.py`, `agent.py` or the search, so it is the one
+measurement above that survives (a) failing. Read three numbers from it, in this
+order of importance:
 
-Two things to build, both general:
+1. **"reactive never fired at all in: N/25 games."** Those are games where the
+   planner has no destination for the entire budget, and a frame-0 proposal is the
+   only thing that can change it. This is the number the whole idea rests on.
+2. **The `tu93` row must not say `FAIL`.** It is the only row graded against
+   pixels read from the game's own source (a 3×3 of colour 14, `tu93.py` 396-445).
+   Coverage elsewhere does not redeem a failure there.
+3. **`agrees with the reactive path`.** Corroboration by an independent route, not
+   proof — `Dream.target_colors` is the thing being replaced and has its own
+   documented phantom-success history. `cd82` and `re86` are expected to read
+   `n/a region-match`; a detector that appeared to succeed on those would be
+   matching something it does not understand.
 
-- **walk there, then press use** — after `navigate` arrives, try each ACT button
-  and keep whichever moves the ratchet in `Progress`.
-- **press-and-see** — for cd82/tr87 there is no avatar and no route, so the
-  imagination has to search over ACT buttons directly in frame space.
+What to read out of (b): `cells/action` **must be well under 0.7** — at 1.0 the key
+is bijective, novelty carries no signal and the search is a paid random walk, which
+is the measured failure `coarsen` exists to fix. Then `restarts/action` (high means
+the budget went on rewinding, not searching), `drift` (should be ~0), `pool=`,
+`coarsen=`, and the `x base` column per cleared level. It prints a loud warning if
+the baselines came back as the silent `[100] * n` fallback, in which case every
+ratio it prints is meaningless.
 
-## 2. Fix rotating-sprite matching
+Compare (d) against **tune 0.177 / hold 0.005** (ratio 0.03). A mechanism that helps
+tune and not hold has been fitted to games it was allowed to see.
 
-wa30 and sc25 each have four working MOVE buttons; the planner sees `[2, 4]`.
+## 1. The rule discovered on 2026-08-23, because it reorders everything below
 
-`Mechanics._fill_deltas` was added to promote single-observation deltas and it
-did **not** fix these — there are *zero* votes for the missing axes. So does
-`settle(min_votes=1)`, already called on the fallback path at `agent.py:484`.
-The cause is upstream, in `percept.moved_objects`: a sprite that rotates as it
-turns never matches as a rigid translation on the axis it is not facing. Match
-by centroid or bbox displacement, not exact rigid shift. Same root cause as the
-worst move accuracy on the set (wa30 43%, sc25 38%).
+> **An action spent on a level you go on to clear costs score quadratically. An
+> action spent on a level you never clear costs nothing but budget.**
 
-## 3. Hypothesis elimination
+Measured from the notebook's own event log. On tn36, `exp_11` split its 583 events
+**31 / 69 / 483** across levels 0 / 1 / 2: cleared the first two off 100 actions,
+then poured 483 into a level it never cleared, and scored **10.71 — exactly the
+2-of-7 completion cap**. `exp_e`, same game and same depth, spent **fewer** total
+actions (329) and scored **1.36**, because it dithered through the two it did clear.
+More actions, 7.9× the score. m0r0 is the rule inverted: 477 actions, level 0
+*cleared*, score 0.02 of an available 4.76.
 
-Sam's idea, which converges with `hyprune/` (literally "Hypothesis Pruning").
-Factorise instead of enumerating: 6 maps x 8 goals x 10 block-sets x 5 collision
-rules x 4 act-effects = 9,600 candidates stored as 33 facts. Refute per billed
-action. Live-pool size then scales with how ambiguous the game still is, which is
-Sam's "number of agents scales with complexity" — but as ~1 ms CPU hypotheses.
+An earlier version of this file and of `ARCHITECTURE.md` carried an "implied speed"
+column back-derived from the scores. It was wrong — the measured action counts run
+the other way — and it has been deleted everywhere it appeared.
 
-**Not LLM subagents.** LLM at 17.6 s/action x 110 games does not fit the 9 h
-budget, and that is exactly what turned experiment 11's 2.68 local into 0.60 on
-Kaggle (`arc3x/student.py:18-21`).
+Three things follow, all now written into `PLAN.md` Phase 3 and `ARCHITECTURE.md`
+§2(b):
 
-## 4. Stop burning the cap
+1. **Burn level 0, and burn any level you are failing.** Level 0's weight is 1 of
+   21–55, at most 4.8% of a game. A level you never clear costs nothing at all.
+2. **Be crisp only where it pays** — levels 1 and 2 must land at ≤1.4× baseline,
+   which means the *model* has to be doing the work by then. That is what
+   `on_new_level`'s carry-over was built for and it has never been exercised.
+3. **`agent.py`'s search throttle keys on the wrong variable.** It reads
+   `RELIVE_ACTIONS if L == 0 else RELIVE_ACTIONS // 4`, keying on the level *index*,
+   when the deciding quantity is what the level has *already* cost: adding `m`
+   actions to a level `n` old multiplies its score by `(n/(n+m))²`, baseline-free,
+   marginal cost falling as `1/n³`. So it throttles a hopeless level 2000 actions
+   deep exactly as hard as a fresh one. Replacement shape:
+   `m = clamp(ALPHA/(L+1) × spent_on_level, floor/(L+1), RELIVE_ACTIONS)`.
+   **Left unimplemented on purpose** — ALPHA and the floor are guesses and
+   `relive.py` has not run once. **This is the first A/B after (d) above.**
 
-Every one of the 25 games spends all 3000 actions. `play()` loops
-imagine -> goal -> cover -> push_frontier -> click -> flail/reset forever with no
-convergence test and no notion of "this level is not going to fall to this
-repertoire".
+## 1b. The win-condition census, read 2026-08-23 — what the games actually want
+
+All 25 games ship as source, so every guard on a `self.next_level()` was read
+rather than guessed. 13 are readable predicates and **10 of the 13 are one shape**:
+
+> every object of kind A must be co-located with an object of kind B.
+
+`ka59` (two pairs at once), `s5i5`, `lp85` (two), `tu93`, `wa30`, `dc22`, `m0r0`,
+`ls20` (sequenced). `cd82` and `re86` are the same idea at pixel granularity — a
+canvas must equal a reference picture. The rest: eliminate a colour (`cn04`,
+`r11l`), a local neighbour constraint (`ft09`), or a flag set elsewhere.
+
+**So the destination is drawn on the board before the first action** — and
+`Dream.target_colors` is `(collectible | prog.consumed) - retired`, both of which
+are *reactive* and stay empty until the agent has accidentally succeeded twice.
+That is the failure `progress.py` opens with: `dc22 move=100%(153) collect=[]
+thought=0 levels=0`. A perfect forward model with nowhere to go. New
+[markers.py](arc3x/markers.py) proposes a destination from frame 0; new
+[why_markers.py](arc3x/why_markers.py) is (e) above. **Not wired into
+`target_colors`, on purpose, until (e) has run.**
+
+Two things this census already settled without spending an action:
+
+- **`tu93` is not sokoban.** Tag `0017unajnymcki` is sprite `0016ihgrljrgpq`, a
+  3×3 of colour 9 with a `4` at `[0][1]`, taken as `[0]` with `set_rotation()`
+  called on it — it is the *avatar with a facing marker*. So tu93 is "avatar
+  reaches an exit", one mover to N exits. Direct source confirmation that facing
+  sprites rotate, which is the rotating-sprite item in §3.
+- **The queued cd82 plan was wrong.** See §3.
+
+## 2. Never judge a change on the 4-game benchmark
+
+`exp_e` (1.36) and `exp_11` (10.71) ran on **identical repo commits** and
+**byte-identical `taaf_setup_env.json`**. Worse, the graft flags live only in
+notebook cell 6, and `context_window: 57344` is applied **in-process** — so the
+env json reports `32768` for every run regardless. The knob most suspected of
+causing wasted actions is the one the bundle never recorded.
+
+**Fixed:** cell 6 now defines `GRAFT_FLAGS` once and writes `graft_flags.json` into
+`/kaggle/working`. Consequence for planning: "graft tuning is 0-for-11" was an
+underpowered experiment, not eleven refuted ideas. Use `suite.py --split both`, or
+the leaderboard.
+
+## 3. Still open from the previous queue
+
+- **ACT buttons plannable.** `Mechanics.acts` exposes buttons that change the board
+  without moving the avatar; `Mechanics.moves` filtered `d != (0,0)` and threw all
+  of them away. 12 of 25 games have one; `cd82` and `tr87` have **nothing else**
+  (`planner-sees=[]`). The general capability is *walk there then press use*.
+  ~~*press-and-see* in frame space for the two avatar-less games~~ — **retracted
+  2026-08-23 after reading `cd82.py` in full (782 lines).** cd82 is not a
+  press-and-see game, it is a *paint-the-canvas* game, and press-and-see would
+  have burned the budget on it:
+  - a 10×10 all-zero **canvas** at (27,34); a 10×10 **target pattern** at (3,3),
+    different per level; win is `np.array_equal(canvas[mask], target[mask])` with
+    `mask` zeroing **both diagonals`.
+  - 5×5 palette swatches set the paint colour; 8 basket slots move around a 3×3
+    ring; **ACTION5 stamps a half-plane** (`[0:5,:]`, `[5:10,:]`, `[:,0:5]`,
+    `[:,5:10]`) or a triangle for diagonal slots; ACTION6 on a bucket stamps a
+    3×4 edge strip.
+  - `_get_valid_actions` is **state-gated** — just clicked → ACTION5 only;
+    counter ≥6 → palette clicks only; ≥3 → moves + palette + bucket. **ACTION5 is
+    not in the default list**, so a press-and-see sweep never even sees the stamp.
+  - a 100-action limit calls `self.lose()`, and `render_interface` writes
+    `frame[63, x] = 4 or 5` — **direct source confirmation of the draining
+    progress bar** that defeats `Volatility.hud_mask`'s 90%-frequency test and
+    produced cd82's 240 phantom progress clicks.
+
+  cd82 needs the **region-match** detector (static reference picture vs changing
+  workspace, objective = mismatch count over `Volatility.changes`), not a button
+  sweep. Specified, not written; see §1b.
+- **Rotating-sprite matching.** `wa30` and `sc25` have four working MOVE buttons and
+  the planner sees `[2, 4]`. `percept.moved_objects` requires an exact rigid shift,
+  so a sprite that turns to face its direction of travel produces *zero* votes on
+  the axis it is not facing. Match on centroid/bbox displacement with a shape-change
+  tolerance. Same root cause as the worst move accuracy on the set (43%, 38%).
+  **Deprioritised 2026-08-23:** `mind.py` already carries two workarounds for this
+  same gap — `_convention()` (line 362) and `_fill_deltas()` (line 410) — and the
+  button convention they encode was measured at **exactly 0.00**. Controls were
+  never the bottleneck; the destination was. `why_moves.py` is still un-run, so the
+  wa30/sc25 attribution remains unconfirmed even though tu93's source proves facing
+  sprites exist in the set.
+- **Hypothesis elimination.** Factorise rather than enumerate: 6 maps × 8 goals × 10
+  block-sets × 5 collision rules × 4 act-effects = 9,600 candidates held as ~33
+  independent facts, refuted per billed action. Live-pool size then scales with how
+  ambiguous the game still is. **CPU candidates at ~1 ms, not LLM subagents** — an
+  LLM at 17.6 s/action × 110 games does not fit the 9 h budget, and that is exactly
+  what turned experiment 11's 2.68 local into 0.60 on Kaggle.
+- **Convergence — but for the corrected reason.** All 25 games spend the full
+  3000-action cap. Per §1 that is not itself the waste: the cost is only the *later*
+  levels those actions could have bought. So the missing test is not "spend less",
+  it is "**stop spending on a hypothesis already known to be dead, and re-aim**".
+  Two games show the shape: one drains its objective to **zero** and then dies,
+  another converts one colour into another two pixels per click for hundreds of
+  actions. Both make monotone progress on a quantity that is not the win condition.
 
 ## Constraints that still hold
 
-- Build from 2.14, do not restart from scratch.
+- Build from 2.14; do not restart from scratch. arc3x standalone is **0.142** and
+  ships as a component source, never as the agent.
 - No per-game hardcoding.
 - Always report coverage out of 25 next to any mean — 23 zeros hide inside 0.142.
-- Only graft into notebook Cell 8 if the local number beats 2.14.
+- The holdout (`cd82 ft09 lf52 m0r0 s5i5 sk48 tn36 vc33`) is fixed and never
+  re-drawn.
+- Only graft into the notebook if the local number beats 2.14.
