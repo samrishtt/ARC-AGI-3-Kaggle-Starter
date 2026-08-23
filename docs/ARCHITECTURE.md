@@ -128,10 +128,54 @@ Kaggle "Submit to Competition"  ← separate, manual, spends a real submission
 ```
 per level: min(115, (baseline_actions / actions_used)² × 100)  if the level was completed
 per level: 0                                                   if not completed
-```
-Quadratic. This is why every optimization in this project has centered on *actions per completed level*, not just "did it complete the level." A completed level taking 33% more actions than necessary loses roughly half its score, not a third.
 
-**Important wrinkle:** on the real graded rerun, `baseline_actions` is not provided by the API (anonymized clones) — `agent_ext.py`'s efficiency note falls back to a heuristic proxy target in that case. Locally (offline validation), the real baseline is available and used directly.
+per game:  min( Σ(level_score_i × w_i) / Σ_all w_i ,        ← weighted mean
+                (Σ cleared w_i / Σ_all w_i) × 100 )          ← completion cap
+           where w_i = i + 1
+```
+
+Quadratic per level, and **capped by completion at the game level**. Both halves
+matter and the second half was missing from this document for a long time, which is
+how "clear the first level of every game" came to look like a strategy.
+
+**Consequence 1 — completion dominates.** At exactly baseline speed each cleared
+level scores 100, so the weighted mean equals the cap and *score = the completion
+cap*. Over the real level counts of the 25 dev games, clearing **level 0 only caps
+the mean at 3.52**; levels 0+1 gives 10.57; 0+1+2 gives 21.14. No amount of
+efficiency work gets a level-0-only solver past 3.52.
+
+**Consequence 2 — an action only costs score on a level you actually clear.** An
+uncleared level contributes 0 to the numerator whatever you spend on it, so those
+actions are free except as budget. This is measured, from this notebook's own event
+logs on tn36 (7 levels, so the 2-level cap is 3/28×100 = 10.71):
+
+| run | total actions | level split (L0/L1/L2) | levels | score |
+|---|---|---|---|---|
+| `exp_e` | 329 | — | 2/7 | **1.36** (13% of cap) |
+| `exp_11` | 467 | **31 / 69 / 483** | 2/7 | **10.71** (100% of cap) |
+
+`exp_11` spent **42% more actions and scored 7.9× higher**, because it cleared the
+first two levels off 100 actions and then poured 483 into a level it never cleared —
+at a cost of exactly zero. `m0r0` is the same rule inverted: 477 actions, level 0
+*cleared*, score **0.02 of an available 4.76**. So the target is not
+actions-per-run; it is *be crisp on levels you clear, and never ration actions on a
+level you are failing.*
+
+**Consequence 3 — this measurement is barely attributable, which is its own
+finding.** `exp_e` and `exp_11` ran on identical repo commits with byte-identical
+`taaf_setup_env.json` (`temperature 0.6`, no seed). Nothing captured differs; the
+graft-flags dict lives in notebook cell 6 and is **not written to the artifact
+bundle**. With one graded play per game on the real submission, the per-game variance
+is large enough that the 4-game local benchmark cannot detect any effect worth
+shipping — the "eleven grafts changed nothing" record is an underpowered experiment,
+not eleven refutations. **Fix: `json.dump` the flags dict into the bundle.** It is
+already in memory at that point.
+
+**Important wrinkle:** on the real graded rerun, `baseline_actions` is not provided
+by the API (anonymized clones) — `agent_ext.py`'s efficiency note falls back to a
+heuristic proxy target in that case. Locally (offline validation), the real baseline
+is available and used directly. So the *agent* never sees the number that its score
+divides by; only the scorer does.
 
 ### Diagnostics + Submission
 - **Purpose:** turn a finished run into human-readable output and the file Kaggle actually grades.

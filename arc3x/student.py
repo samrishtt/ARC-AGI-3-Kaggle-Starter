@@ -56,9 +56,18 @@ NO PER-GAME KNOWLEDGE
 ---------------------
 One set of weights for all games. Nothing keyed on game id, and the input is
 only the rendered frame, so a game the model has never seen still gets a
-prior. That is the point: the graded run is ~110 clones of these 25 families,
-and a policy that generalises across families is what survives a clone whose
-layout has been perturbed.
+prior. That is not a nicety, it is the whole reason this file exists: the
+scored set is **110 private games the agent has never seen**, and the 25 games
+that ship with the dataset are a development instrument, not families the
+scored set is drawn from.
+
+That fact is what rules out the alternative. Go-Explore in ``explore.py`` needs
+a local engine file to ``deepcopy``; hidden games have none, and the gateway
+runs ``environments_dir=""`` and cannot be cloned or rewound. So free search
+cannot run on a scored game at all, and a searched plan cannot be replayed into
+one either. Search's only route to the leaderboard is as a **teacher** whose
+free, provably-optimal traces train these weights - which then transfer,
+because they read pixels rather than game ids.
 """
 
 from __future__ import annotations
@@ -144,12 +153,19 @@ class Student:
     games: tuple[str, ...] = ()
 
     @classmethod
-    def new(cls, hidden: int = 256, seed: int = 0) -> "Student":
+    def new(cls, hidden: int = 256, seed: int = 0, n_in: int = N_IN) -> "Student":
+        """``n_in`` is the width of the input encoding.
+
+        Defaults to the 4096 of ``featurise``, but ``arc3x/features.py`` offers
+        narrower palette-invariant encodings, and the whole point of comparing
+        them is that only the input meaning changes - so the width has to be a
+        parameter rather than a constant.
+        """
         rng = np.random.default_rng(seed)
         # He init on layer 1 (ReLU), small init on the output layer so the
         # initial prior is near-uniform and cannot hurt the search.
         return cls(
-            w1=(rng.standard_normal((N_IN, hidden)) * np.sqrt(2.0 / N_IN)).astype(np.float32),
+            w1=(rng.standard_normal((n_in, hidden)) * np.sqrt(2.0 / n_in)).astype(np.float32),
             b1=np.zeros(hidden, dtype=np.float32),
             w2=(rng.standard_normal((hidden, N_OUT)) * 0.01).astype(np.float32),
             b2=np.zeros(N_OUT, dtype=np.float32),

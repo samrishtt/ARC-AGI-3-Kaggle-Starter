@@ -211,6 +211,12 @@ def _build_solver(original: Any, flags: dict[str, Any], active: dict[str, Any]) 
             solver_obj = apply_void(solver_obj)
             active["schema_void"] = True
 
+    if flags.get("state_dedup"):
+        apply_dedup = _import_optional("taaf_grafts.state_dedup", "apply_state_dedup")
+        if apply_dedup is not None:
+            solver_obj = apply_dedup(solver_obj)
+            active["state_dedup"] = True
+
     return solver_obj
 
 
@@ -338,6 +344,8 @@ def install(
             print("[schema_notes] armed")
         if active.get("schema_helpers"):
             print("[schema_helpers] armed")
+        if active.get("state_dedup"):
+            print("[state_dedup] armed")
     except Exception as err:  # noqa: BLE001 — install must never take the run down
         for revert in reversed(reverts):
             try:

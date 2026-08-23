@@ -52,6 +52,19 @@ Go-Explore. So counting happens only over pixels outside the volatility HUD mask
 tracking starts only once that mask has enough observations to be meaningful, and
 the history is discarded whenever the mask changes shape.
 
+**The mask alone is not enough, and we found that out the hard way.** Volatility
+asks "does this pixel change often". A bar that loses one pixel per action changes
+each individual pixel on about 1/154 of frames, so it never crosses the threshold:
+cd82's mask came out completely empty, its 154-pixel bar counted as playfield, and
+the agent reported progress on 240 consecutive clicks while clicking at random and
+watching its own budget drain. Exactly the failure this paragraph was written to
+rule out, arriving through the one door the mask does not cover.
+
+So there is a second, count-based guard - see ``CLOCK_RATE`` - which asks how
+*often* a colour's total moves and by how much. A counter ticks by one on nearly
+every action; a set of objects goes away in object-sized chunks on the few actions
+that touch one.
+
 The history is also cut on a level change or a reset, because those restore the
 board: comparing a fresh level's counts against the previous one's would read the
 restoration as a giant increase and reject every real collectible.
@@ -80,6 +93,21 @@ UNDO_RATIO = 3
 # this - a board-sized colour 0 with a clean downward ratchet - and chasing it
 # would have replaced "no destination" with "an unreachable one".
 MAX_SHARE = 0.25
+# A colour that moves on nearly every action, by exactly one pixel, is a counter:
+# a step budget, a health bar, a fuel gauge. It is the one thing that must never
+# be mistaken for an objective, because "make this number go down" is satisfied by
+# doing literally anything and the agent will happily spend its whole budget
+# watching it drain. Measured on cd82: colour 4 falls 154 -> 126 by exactly one
+# pixel per click, and the agent reported progress on 240 consecutive clicks.
+#
+# The HUD mask cannot catch this. Volatility asks "does this pixel change often",
+# and a bar that loses one pixel per action changes each individual pixel on about
+# 1/154 of frames - far under HUD_THRESH. cd82's mask is empty. So the test has to
+# be on the *count* rather than on the pixels: how often does the total move, and
+# by how much.
+CLOCK_RATE = 0.55   # moved on this fraction of observed frames
+CLOCK_UNIT = 0.75   # and that fraction of the moves were by exactly one pixel
+CLOCK_MIN = 12      # not before there is enough history to mean anything
 
 
 @dataclass
@@ -94,6 +122,12 @@ class Progress:
     # largest count ever seen per colour, to recognise a flood rather than a thing
     peak: Counter = field(default_factory=Counter)
     field_size: int = 0
+    # How many frame-to-frame comparisons have been made, how often each colour's
+    # count moved at all, and how often it moved by exactly one pixel. Together
+    # these separate a counter from a collectible - see CLOCK_RATE above.
+    steps: int = 0
+    moved: Counter = field(default_factory=Counter)
+    unit: Counter = field(default_factory=Counter)
 
     def cut(self) -> None:
         """Forget the previous frame without forgetting what was learned.
@@ -118,6 +152,9 @@ class Progress:
             self.field_size = int((~hud).sum())
         vals, counts = np.unique(frame[~self.hud], return_counts=True)
         now = {int(v): int(n) for v, n in zip(vals, counts)}
+        had_prev = bool(self.last)
+        if had_prev:
+            self.steps += 1
         for c, n in now.items():
             if n > self.peak[c]:
                 self.peak[c] = n
@@ -125,6 +162,10 @@ class Progress:
                 continue
             prev = self.last.get(c)
             if prev is not None:
+                if n != prev:
+                    self.moved[c] += 1
+                    if abs(n - prev) == 1:
+                        self.unit[c] += 1
                 if n < prev:
                     self.fell[c] += 1
                 elif n > prev:
@@ -134,6 +175,9 @@ class Progress:
         for c, prev in self.last.items():
             if c not in now and c not in self.ignore and prev > 0:
                 self.fell[c] += 1
+                self.moved[c] += 1
+                if prev == 1:
+                    self.unit[c] += 1
         self.last = now
 
     # -- what ratchets -----------------------------------------------------
@@ -144,6 +188,27 @@ class Progress:
             self.field_size and self.peak[c] > MAX_SHARE * self.field_size
         )
 
+    def _clock(self, c: int) -> bool:
+        """Is this colour a counter - a step budget, a bar - rather than a thing?
+
+        Two conditions, and both are needed. *Moves nearly every frame* on its own
+        would reject a collectible in a game where every move picks something up.
+        *Moves by exactly one* on its own would reject single-pixel pickups. A
+        quantity that does both is a number being displayed, not a set of objects
+        being cleared: objects go away in object-sized chunks, and only on the few
+        actions that actually touch one.
+
+        This is the guard that ``MAX_SHARE`` is to floods. Both exist because the
+        ratchet rule is powerful enough to find a monotone quantity in almost any
+        game, and not every monotone quantity is the point of the game.
+        """
+        n = self.moved[c]
+        return bool(
+            self.steps >= CLOCK_MIN
+            and n >= CLOCK_RATE * self.steps
+            and self.unit[c] >= CLOCK_UNIT * n
+        )
+
     def _ratchet(self, down: bool) -> set[int]:
         a, b = (self.fell, self.rose) if down else (self.rose, self.fell)
         return {
@@ -152,6 +217,7 @@ class Progress:
             if n >= MIN_CLICKS
             and n >= UNDO_RATIO * b.get(c, 0)
             and not self._flood(c)
+            and not self._clock(c)
         }
 
     @property
@@ -172,18 +238,11 @@ class Progress:
             m &= ~self.hud
         return int(m.sum())
 
-    def score(self, frame: np.ndarray) -> int | None:
-        """Distance from done - lower is better. ``None`` = no notion yet.
-
-        Returning None rather than 0 matters: "everything is equally good" and
-        "I have no idea what good means" lead to opposite decisions, and only the
-        second one should stop the agent from planning.
-        """
-        few = self.consumed
-        many = self.built
-        if not few and not many:
-            return None
-        return self.count(frame, few) - self.count(frame, many)
+    # There is deliberately no ``score`` here. Turning these counts into a single
+    # distance-from-done needs ``collectible`` as well, which lives on ``Dream``,
+    # and this class used to carry a second copy of that arithmetic that nothing
+    # called - a duplicate of the exact subtraction that produced 960 phantom
+    # successes across the suite. One implementation, in ``Dream.objective``.
 
     def summary(self) -> str:
         return f"consumed={sorted(self.consumed)} built={sorted(self.built)}"

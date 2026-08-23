@@ -35,13 +35,24 @@ gateway does expose real IDs.
 
 REPLAY IS VERIFIED, NOT ASSUMED
 -------------------------------
-The graded set is ~110 clones of 25 families. If a clone is byte-identical to
-its family, replay is exact. If it is *perturbed*, a memorised plan walks into a
-different state and scores zero. We do not know which it is, so replay checks
-every step: after each graded action, compare the gateway's frame to the frame
-the twin predicted. On divergence we stop immediately and hand over to the
-fallback, rather than burning the remaining actions on a plan that is already
-wrong.
+**Read this before relying on rung 1.** The scored set is 110 private games the
+agent has never seen (competition Data page, confirmed 2026-08-23), *not* clones
+of the 25 that ship with the dataset. An earlier version of this docstring
+claimed the opposite; that claim came from ``taaf/competition_arcade.py``, which
+is explicitly a **local simulator** whose ``clone_game_ids`` mints ``k000,
+k001…`` to fake 110 runs out of 25 games for harness testing. It was never
+evidence about the real competition.
+
+So ``identify`` will almost always return "unknown" on a scored game, rung 1
+will not fire, and the run will be decided by rungs 2 and 3. Rung 1 remains
+correct and worth keeping - it costs nothing when it does not match, and it is
+how this module is tested offline against the local twins - but it is not the
+scoring path.
+
+Even when a match does occur it is not trusted: after each graded action, the
+gateway's frame is compared to the frame the twin predicted, and on divergence
+we stop immediately rather than burn the remaining actions on a plan that is
+already wrong.
 
 FALLBACK LADDER
 ---------------

@@ -48,6 +48,11 @@ from arc3x.percept import Volatility, mask_component, moved_objects
 from arc3x.progress import Progress
 
 MAX_IMAGINE = 4096
+# One unit of "something got collected" is worth more than any possible amount of
+# "something got assembled". 4096 is the whole board, so no assembly term can ever
+# reach across a single collection step. Keeping them in one integer lets the
+# breadth-first search compare boards without a second criterion.
+BUILT_SCALE = 4096
 
 
 @dataclass
@@ -73,6 +78,18 @@ class Dream:
     # destination on any game that is not "eat the gems", and a route with no
     # destination is no route: dc22 and ka59 predict perfectly and plan nothing.
     prog: Progress = field(default_factory=Progress)
+    # Colours the agent chased to exhaustion and got nothing for. The ratchet can
+    # only say "this is being used up", never "this is what the game wants", and
+    # some games use something up as a side effect of play. Measured: one game
+    # drains a colour from 63 pixels to *zero* and then dies, another converts one
+    # colour into another two pixels per click for hundreds of actions. Both are
+    # real monotone progress on a quantity that is not the win condition.
+    #
+    # So there has to be a way to be wrong and recover. A colour whose count hit
+    # the floor with no level to show for it is definitively not the objective, and
+    # continuing to push it is the most expensive mistake available - the agent has
+    # a destination, believes in it, and walks there for the rest of the budget.
+    retired: set[int] = field(default_factory=set)
     # honesty ledger: was the copy right? Split by whether anything actually
     # happened, because a game where the avatar is usually blocked hands out a
     # free 100% to any model that predicts "nothing changed" - ka59 scored
@@ -459,15 +476,67 @@ class Dream:
         Distinguishing None from 0 is the point. "Everything is equally good" and
         "I do not know what good means" call for opposite behaviour, and only the
         second should stop the agent from planning at all.
+
+        THE BUILT TERM HAS TO BE BOUNDED, AND WAS NOT
+        ---------------------------------------------
+        This used to be ``count(consumed) - count(built)``, and that subtraction
+        is a reward with no floor: on a game where every click paints a few more
+        pixels of some colour, the objective falls by a few *every click, for
+        ever*. Measured - one game clicked 237 times, every single click scored as
+        an improvement, and it completed nothing. 960 phantom successes across the
+        suite, the largest single waste anywhere in the run.
+
+        The fix is to measure assembly as **distance below its own record** rather
+        than as a raw count. That has a floor at zero, and it cannot be farmed:
+        painting more raises the record by the same amount, so the reward for
+        exceeding it is zero. It is the ratchet's own logic applied to itself.
+
+        Consumption keeps a plain count because it already has a real floor - the
+        collectibles run out - and it is scaled so that one collectible outranks
+        any amount of assembly. Assembly is a tie-break, not a gradient: it says
+        *which* of two equally-collected boards is further along, never that
+        painting is worth more than picking something up.
         """
-        few = self.collectible | self.prog.consumed
-        many = self.prog.built - few
+        few = self.target_colors
+        many = self.prog.built - few - self.retired
         if not few and not many:
             return None
-        s = int(np.isin(frame, list(few)).sum()) if few else 0
+        gap = 0
         if many:
-            s -= int(np.isin(frame, list(many)).sum())
-        return s
+            target = sum(self.prog.peak[c] for c in many)
+            gap = max(0, target - self.prog.count(frame, many))
+        if not few:
+            return gap
+        return self.prog.count(frame, few) * BUILT_SCALE + min(gap, BUILT_SCALE - 1)
+
+    @property
+    def target_colors(self) -> set[int]:
+        """The colours currently believed to be the objective, minus the retired.
+
+        One source of truth. Three places used to recompute
+        ``collectible | consumed`` independently - the objective, the cell list the
+        planner walks to, and the click ranking - and a retirement that reached only
+        some of them would leave the agent avoiding a colour in one branch while
+        still chasing it in another.
+        """
+        return (self.collectible | self.prog.consumed) - self.retired
+
+    def retire(self, why: str = "") -> set[int]:
+        """Give up on the current objective and let the next one form.
+
+        Called when the agent has driven the objective as far as it goes and the
+        game has not ended. Everything currently believed to be the target is
+        struck, which is deliberately blunt: the evidence says the *set* was wrong,
+        not which member of it, and the ratchet will re-form a new set from
+        whatever is still moving. Returns what was retired, for the record.
+
+        Without this the most confident failure mode in the system is unrecoverable
+        - a wrong destination costs more than no destination, because the agent
+        walks to it for the rest of the budget.
+        """
+        gone = self.target_colors
+        self.retired |= gone
+        return gone
 
     def think(
         self,
@@ -524,7 +593,7 @@ class Dream:
         """Cells worth reaching, for the walker to use when the search comes back
         empty. The imagination only returns a route it can *prove* helps; this is
         the weaker claim that the ratcheting colours are where to go looking."""
-        few = self.collectible | self.prog.consumed
+        few = self.target_colors
         if not few:
             return []
         ys, xs = np.nonzero(np.isin(frame, list(few)))
