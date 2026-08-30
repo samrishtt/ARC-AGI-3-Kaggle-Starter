@@ -116,6 +116,9 @@ The checked-in `arc3x` solver is the active research implementation. The
 frame-0 marker detector remains experimental: its diagnostic currently passes
 23/25 coverage but fails the source-grounded `tu93` check, so it is not wired
 into the planner. This is intentional until an objective detector is validated.
+The human-mind learner in `arc3x/mindgraft.py` now treats level changes as scene
+cuts and excludes them from motion and geometry learning, preventing a new board
+from poisoning the previous level's internal model.
 
 Run the fast validation checks from the repository root:
 

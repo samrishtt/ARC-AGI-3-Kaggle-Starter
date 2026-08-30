@@ -317,18 +317,21 @@ class Mind:
         fresh = trs[self.seen :]
         self.seen = len(trs)
         for tr in fresh:
-            self.mech.observe(
-                tr.press.aid,
-                tr.before,
-                tr.after,
-                level_up=tr.level_up,
-            )
-            self.folded += 1
+            # A level transition is a scene cut: the after-frame is a new board,
+            # not the result of translating the old avatar. Feeding that pair to
+            # Mechanics would create false movement votes and false wall/ground
+            # evidence. The level-up action is still consumed by the history
+            # cursor, but only same-level transitions train the predictive model.
+            if not tr.level_up:
+                self.mech.observe(tr.press.aid, tr.before, tr.after)
+                self.folded += 1
             self.level = tr.level_after
         if fresh and settle:
             self.mech.settle()
         if not self.grounded and self.mech.avatar >= 0 and trs:
-            self.mech.replay_geometry((t.press.aid, t.before, t.after) for t in trs)
+            self.mech.replay_geometry(
+                (t.press.aid, t.before, t.after) for t in trs if not t.level_up
+            )
             self.grounded = True
         return len(fresh)
 
@@ -445,12 +448,15 @@ def backtest(entries: Sequence[Any], *, holdout: float = 0.3, game: str = "") ->
 
     mind = Mind()
     for tr in train:
-        mind.mech.observe(tr.press.aid, tr.before, tr.after, level_up=tr.level_up)
+        if not tr.level_up:
+            mind.mech.observe(tr.press.aid, tr.before, tr.after)
     mind.mech.settle()
     # Second pass: what stops the sprite, now that there is a sprite to stop.
     # Without this the model has no walls at all and every held-out miss is
     # "walked through one in imagination" - see Mechanics._track.
-    mind.mech.replay_geometry((t.press.aid, t.before, t.after) for t in train)
+    mind.mech.replay_geometry(
+        (t.press.aid, t.before, t.after) for t in train if not t.level_up
+    )
     report.buttons = len(mind.mech.moves)
     report.assumed = len(mind.mech.assumed & set(mind.mech.moves))
     report.n = len(test)
