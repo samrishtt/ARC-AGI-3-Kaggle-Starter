@@ -132,3 +132,13 @@ $env:PYTHONPATH = "."
 
 The full scored suite is intentionally separate because it is CPU-intensive:
 `arc3x\suite.py --split both -w 10 --budget 3000`.
+
+To build the experimental human-mind Kaggle notebook from the known v17 base:
+
+```powershell
+.venv\Scripts\python.exe tools\build_mind_notebook.py
+```
+
+This produces `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v18-human-mind.ipynb`.
+It is ready for a Kaggle experiment, but its remote score still requires an
+actual Kaggle run and must not be treated as proven in advance.
