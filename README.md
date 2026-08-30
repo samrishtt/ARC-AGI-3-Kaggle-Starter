@@ -109,3 +109,23 @@ Our optimization strategy targets all three levers:
 - **Model**: Qwen3.6-27B-FP8 served via vLLM on Kaggle H100 GPUs
 - **Agent Framework**: Tufa Labs TAAF (The Agent Architecture Framework)
 - **Runtime**: ~2h 20m per submission, ~110 clones across ~25 game families
+
+## Current state and local validation
+
+The checked-in `arc3x` solver is the active research implementation. The
+frame-0 marker detector remains experimental: its diagnostic currently passes
+23/25 coverage but fails the source-grounded `tu93` check, so it is not wired
+into the planner. This is intentional until an objective detector is validated.
+
+Run the fast validation checks from the repository root:
+
+```powershell
+$env:PYTHONPATH = "."
+.venv\Scripts\python.exe -m compileall -q arc3x tools
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+.venv\Scripts\python.exe tools\verify_submission_notebook.py
+.venv\Scripts\python.exe arc3x\why_markers.py --steps 400
+```
+
+The full scored suite is intentionally separate because it is CPU-intensive:
+`arc3x\suite.py --split both -w 10 --budget 3000`.
