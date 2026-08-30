@@ -91,6 +91,7 @@ from arc3x.mindgraft import (
     parse_press,
     resolve_name,
 )
+from arc3x.progress import Progress
 
 # Framework levels are 1-based: `runtime_state.frame_from_payload` clamps with
 # `max(1, ...)`, so `frame.level == 1` is the level the scorer calls index 0.
@@ -316,6 +317,9 @@ class Pilot:
     # was never exercised because almost nothing cleared level 0).
     mind: Mind = field(default_factory=Mind)
     sense: CellSense = field(default_factory=CellSense)
+    #: History-only monotonic progress detector. Unlike goal_colors learned from
+    #: a completed level, this can form an objective before the first win.
+    progress: Progress = field(default_factory=Progress)
     #: Colours the goal is drawn in, if something that can read frame 0 says so.
     #: Left empty here: this is the socket the LLM goal-oracle plugs into, and
     #: an empty set costs only the fallbacks below, never a wrong target.
@@ -360,6 +364,7 @@ class Pilot:
     #: Cursor into ``history`` for click attribution. Separate from
     #: ``Mind.seen``, which counts transitions rather than entries.
     _hist_seen: int = 0
+    _progress_seen: int = 0
 
     # -- accounting -----------------------------------------------------------
     batches: int = 0
@@ -378,6 +383,35 @@ class Pilot:
         """
         fresh = self.mind.absorb(history)
         self.sense.absorb(history)
+
+        # Progress needs the same online frame stream as the mind. Feed only new
+        # entries, cut at scene boundaries, and use CellSense's published mask as
+        # the HUD exclusion once enough frames exist. If the mask was just
+        # published, replaying the retained history once seeds the count ledger
+        # without re-counting on later turns.
+        start = 0 if self._progress_seen and self.progress.last == {} else self._progress_seen
+        if self.progress.last == {} and self.sense.mask is not None:
+            start = 0
+        prev_level: int | None = None
+        if start > 0:
+            previous = getattr(history[start - 1], "frame", None)
+            prev_level = int(getattr(previous, "level", -1) or -1)
+        for i in range(start, len(history)):
+            entry = history[i]
+            frame_obj = getattr(entry, "frame", None)
+            level_i = int(getattr(frame_obj, "level", -1) or -1)
+            if prev_level is not None and level_i >= 0 and level_i != prev_level:
+                self.progress.cut()
+            if is_reset(getattr(entry, "action", None)):
+                self.progress.cut()
+            grid = _grid(entry)
+            hud = None
+            if self.sense.mask is not None and self.sense.mask.shape == getattr(grid, "shape", ()):
+                hud = ~self.sense.mask
+            if grid is not None:
+                self.progress.add(grid, hud, observed=i + 1)
+            prev_level = level_i
+        self._progress_seen = len(history)
 
         # Which clicks did anything? A click that changed the board is a live
         # cell, and per the click survey the special cells cluster - a median of
@@ -739,9 +773,14 @@ class Pilot:
         """
         mech = self.mind.mech
         blocked = mech.blocked_set
-        sources = [self.goal_hint, {c for c, n in mech.goal_colors.items() if n > 0}]
+        sources = [
+            self.goal_hint,
+            {c for c, n in mech.goal_colors.items() if n > 0},
+            set(self.progress.consumed),
+        ]
         if self._lab:
             sources.append({c for c, n in mech.vanished.items() if n > 0})
+            sources.append(set(self.progress.built))
         for source in sources:
             picked = {int(c) for c in source if int(c) != mech.background} - blocked
             if picked:

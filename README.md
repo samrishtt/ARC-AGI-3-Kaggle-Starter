@@ -119,6 +119,16 @@ into the planner. This is intentional until an objective detector is validated.
 The human-mind learner in `arc3x/mindgraft.py` now treats level changes as scene
 cuts and excludes them from motion and geometry learning, preventing a new board
 from poisoning the previous level's internal model.
+`arc3x/pilot.py` also maintains a history-only progress ledger: colors that
+ratchet down or up across ordinary play can become objective evidence without
+hard-coding a game or color. This is guarded against large floods and clock-like
+HUD counters, and has regression tests in `tests/test_progress_pilot.py`.
+
+The current local pilot benchmark is a development diagnostic, not a claim of
+general solving: the fixed 25-game public suite currently clears 1/25 games and
+scores 0.111 (the same result after the progress integration). The competition
+also evaluates private clones, so no private-set or all-games result is known
+until Kaggle runs the notebook.
 
 Run the fast validation checks from the repository root:
 
