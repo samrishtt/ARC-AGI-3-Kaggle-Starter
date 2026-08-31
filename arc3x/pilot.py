@@ -80,6 +80,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from arc3x.clicks import ClickModel
 from arc3x.mindgraft import (
     AID_LABEL,
     CLICK_AID,
@@ -317,6 +318,12 @@ class Pilot:
     # was never exercised because almost nothing cleared level 0).
     mind: Mind = field(default_factory=Mind)
     sense: CellSense = field(default_factory=CellSense)
+    #: A separate model for the coordinate-dependent ACTION6.  `Mechanics`
+    #: correctly refuses to pretend that a click has one fixed displacement;
+    #: this model learns the click's semantics from `(before, after, row, col)`.
+    #: It survives level boundaries, because level 0 is where a click's grammar
+    #: is learned and later levels are where that grammar earns its score.
+    click_model: ClickModel = field(default_factory=ClickModel)
     #: History-only monotonic progress detector. Unlike goal_colors learned from
     #: a completed level, this can form an objective before the first win.
     progress: Progress = field(default_factory=Progress)
@@ -422,25 +429,37 @@ class Pilot:
             prev_level = level_i
         self._progress_seen = len(history)
 
-        # Which clicks did anything? A click that changed the board is a live
-        # cell, and per the click survey the special cells cluster - a median of
-        # two clusters per game - so a live cell makes its neighbours worth more
-        # than any unexplored colour does.
+        # Learn the click grammar in two passes over just the new entries.  A
+        # raw `before != after` test is wrong here: a countdown HUD changes on
+        # every action, and formerly made *every* click appear live.  The first
+        # pass lets ClickModel identify such volatile pixels from all actions;
+        # the second judges each click after that exclusion has been learned.
         #
-        # Cursor is on *entries*, not transitions: RESET and unknown labels are
-        # skipped by `transitions()`, so the two lengths differ and a cursor on
-        # the transition count would re- or under-scan. Attributed straight from
-        # the entry pair, which also avoids `transitions()` dropping a click whose
-        # grid shape changed and crediting the wrong cell for the change.
-        for i in range(max(1, self._hist_seen), max(self._hist_seen, len(history))):
-            press = parse_press(getattr(history[i], "action", None))
-            if press is None or not press.is_click or press.row < 0:
-                continue
-            self.clicked.add((press.row, press.col))
+        # Cursor is on entries, not transitions: RESET/unknown labels can be
+        # skipped by `transitions()`, so a transition cursor would re- or
+        # under-scan.  Keep pairs locally rather than materialising all historic
+        # transitions again; this path stays proportional to new actions.
+        pairs: list[tuple[np.ndarray, np.ndarray]] = []
+        click_events: list[tuple[np.ndarray, np.ndarray, Press]] = []
+        for i in range(max(1, self._hist_seen), len(history)):
             before, after = _grid(history[i - 1]), _grid(history[i])
             if before is None or after is None or before.shape != after.shape:
                 continue
-            if bool((before != after).any()):
+            pairs.append((before, after))
+            press = parse_press(getattr(history[i], "action", None))
+            if press is None or not press.is_click or press.row < 0 or press.col < 0:
+                continue
+            self.clicked.add((press.row, press.col))
+            before_level = int(getattr(getattr(history[i - 1], "frame", None), "level", -1) or -1)
+            after_level = int(getattr(getattr(history[i], "frame", None), "level", -1) or -1)
+            # A level transition redraws a fresh scene. It is useful to locate
+            # HUD chrome but cannot reveal the local semantics of a click.
+            if before_level == after_level:
+                click_events.append((before, after, press))
+        self.click_model.learn_volatile(pairs)
+        for before, after, press in click_events:
+            tags = self.click_model.observe(before, after, press.row, press.col)
+            if tags and tags != "inert":
                 self.live_clicks.add((press.row, press.col))
         self._hist_seen = len(history)
         return fresh
@@ -550,6 +569,15 @@ class Pilot:
         self, frame: np.ndarray, aids: list[int], valid: Sequence[str] | None
     ) -> Plan | None:
         """Shortest route to a believed goal colour. The only phase that scores."""
+        # A verified route that left the informative cell unchanged has already
+        # falsified its objective hypothesis.  Replaying it after the first
+        # repeat turns a useful level into an action sink (and, once conceded,
+        # keeps the later laboratory phases permanently unreachable).  Let the
+        # frontier/click machinery form a new hypothesis instead.  This is a
+        # state-based guard, not a game-specific retry limit: a changing board
+        # continues to execute the shortest route normally.
+        if self.stalls:
+            return None
         targets = self._cells(frame, self._goal_colors(frame))
         if not targets:
             return None
@@ -768,54 +796,130 @@ class Pilot:
     def _click(
         self, frame: np.ndarray, aids: list[int], valid: Sequence[str] | None
     ) -> Plan | None:
-        """Click the cells most likely to be special, cheapest signal first.
+        """Act on a learned click grammar, with novelty only as a fallback.
 
-        Measured over all 25 games: every one of the 4,096 cells collapses to
-        between 1 and 11 distinct outcomes with ~96% of clicks landing on the
-        modal one, and the cells that do something sit on **minority colours at
-        7.83x chance**, in a median of two clusters. So: neighbours of a cell
-        already known to be live, then representatives of the rarest colours,
-        spread out so three picks are not three pixels of one blob.
+        A click is not a sixth direction.  It can be a coordinate-free advance,
+        a teleport, a paint stroke, a local toggle, or a remote widget.  Those
+        cases need different search spaces, so the classifier gets first say:
+
+        * a confidently coordinate-free ``step`` repeats one harmless central
+          coordinate, including (cautiously) on the next level;
+        * spatial rules favour inferred targets and colours that have already
+          responded, before spending clicks on rare visual objects;
+        * a confidently inert click is handed back rather than farming a HUD.
+
+        Until the model has evidence this remains the old general rarity probe.
+        No game id, fixed coordinate, or public-board property is encoded here.
         """
         if CLICK_AID not in aids:
             return None
-        if not self._lab and not self.live_clicks:
+        kind, confidence = self.click_model.verdict()
+        if kind == "inert":
             return None
+
+        # A settled coordinate-free or predictive spatial rule is the part that
+        # genuinely transfers from level 0.  On a fresh later level it earns one
+        # confirmation click first; an unproven coordinate search is still sent
+        # to the language-model fallback rather than being billed blindly.
+        transfer = kind in {"step", "teleport", "paint"} and confidence >= 0.8
+        if not self._lab and not self.live_clicks and not transfer:
+            return None
+        if kind == "step":
+            return self._click_step(frame, valid, confidence)
 
         picks: list[tuple[int, int]] = []
         H, W = frame.shape
+
+        def add(cells: Sequence[tuple[int, int]], limit: int) -> None:
+            fresh = [cell for cell in cells if cell not in self.clicked and cell not in picks]
+            picks.extend(self._spread(fresh, limit))
+
+        counts = self._counts(frame)
+
+        # Specific rules get to choose their likely objectives first.  A target
+        # colour comes only from a caller hint, a previous completion, or a
+        # monotone on-board progress signal - never from a game label.
+        if kind in {"teleport", "paint"}:
+            for color in sorted(self._goal_colors(frame), key=lambda c: counts.get(c, frame.size)):
+                add(self._cells(frame, {color}), self.clicks_per_color)
+
+        # Learn which *under-colours* have reacted to clicks.  This makes a
+        # discovered button/object reusable when the board is redrawn at level
+        # 1, and avoids treating every HUD-ticked background pixel as live.
+        for color in self.click_model.clickable(frame):
+            if len(picks) >= self.click_batch:
+                break
+            add(self._cells(frame, {color}), self.clicks_per_color)
+
+        # A genuine active click often belongs to a small object rather than an
+        # isolated pixel.  Once semantics have ruled out HUD-only changes, its
+        # immediate neighbourhood is a compact, general local search.
         for (y, x) in sorted(self.live_clicks):
+            if len(picks) >= self.click_batch:
+                break
             for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 cell = (y + dy, x + dx)
                 if 0 <= cell[0] < H and 0 <= cell[1] < W and cell not in self.clicked:
-                    picks.append(cell)
+                    add([cell], 1)
 
-        counts = self._counts(frame)
+        # Fall back to visually unusual cells only while learning (or after a
+        # supported spatial interaction has given us a first current-level
+        # response).  This keeps the discovery path broad without letting it
+        # swamp a rule that already says where interaction happens.
         bg = self.mind.mech.background
         for color in sorted(counts, key=lambda c: counts[c]):
             if len(picks) >= self.click_batch:
                 break
             if color == bg or counts[color] >= frame.size // 4:
                 continue
-            ys, xs = np.nonzero(frame == color)
-            cand = [
-                (int(y), int(x)) for y, x in zip(ys, xs) if (int(y), int(x)) not in self.clicked
+            add(self._cells(frame, {color}), self.clicks_per_color)
+
+        # Prediction is not required to try a spatial rule - a changed sprite
+        # can become ambiguous after a level redraw - but whenever it does speak
+        # it ranks the candidate ahead of unmodelled probes.
+        if kind == "teleport":
+            predicted = [
+                cell for cell in picks if self.click_model.predict(frame, cell[0], cell[1]) is not None
             ]
-            picks.extend(self._spread(cand, self.clicks_per_color))
+            if predicted:
+                predicted_set = set(predicted)
+                picks = predicted + [cell for cell in picks if cell not in predicted_set]
 
         seen: set[tuple[int, int]] = set()
         out: list[Press] = []
+        # A transferred spatial rule has not yet proved that this level shares
+        # its predecessor's layout.  Spend a single confirming action before
+        # returning to normal batches; laboratory clicks remain cheap probes.
+        budget = min(self.click_batch, self._cap)
+        if not self._lab and not self.live_clicks:
+            budget = 1
         for cell in picks:
             if cell in seen or cell in self.clicked:
                 continue
             seen.add(cell)
             self.clicked.add(cell)
             out.append(self._press(CLICK_AID, valid, row=cell[0], col=cell[1]))
-            if len(out) >= min(self.click_batch, self._cap):
+            if len(out) >= budget:
                 break
         if not out:
             return None
-        return Plan(out, "click", f"{len(out)} cells, {len(self.live_clicks)} live")
+        return Plan(out, f"click-{kind}", f"{len(out)} cells, {len(self.live_clicks)} live")
+
+    def _click_step(
+        self, frame: np.ndarray, valid: Sequence[str] | None, confidence: float
+    ) -> Plan:
+        """Repeat one central click after learning that coordinates are ignored.
+
+        The centre is deliberately not remembered from the preceding board.  A
+        ``step`` verdict says coordinates do not affect the action, while a new
+        level may legitimately move all visible widgets; choosing the current
+        centre makes the transfer independent of both layouts.  Later levels get
+        one confirming press; laboratory levels can batch the known action.
+        """
+        h, w = frame.shape
+        n = min(self.click_batch, self._cap) if self._lab else 1
+        press = self._press(CLICK_AID, valid, row=h // 2, col=w // 2)
+        return Plan([press for _ in range(n)], "click-step", f"centre x{n}, {confidence:.0%} coordinate-free")
 
     # -- the imagination gate -------------------------------------------------
 

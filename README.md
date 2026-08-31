@@ -130,12 +130,15 @@ cleared at a level transition while the learned mechanics model is retained for
 the next level.
 
 The current local pilot benchmark is a development diagnostic, not a claim of
-general solving: the fixed 25-game public suite currently clears level 0 in
-3/25 games and scores 0.156 under the 60-turn/3,000-action pilot harness,
-up from 1/25 and 0.111 before map coverage. One new clear (`m0r0`) is in the
-repository's pre-defined public holdout; this supports, but does not prove,
-generalisation. The competition's private score and all-games coverage remain
-unknown until Kaggle runs the notebook.
+general solving. Under the fixed 25-game public suite and a 60-turn/3,000-action
+pilot harness, it clears at least one level in **6/25** games and at least two
+levels in **1/25**, for a mean score of **0.662**. The cleared games are
+`lp85`, `ls20`, `m0r0`, `r11l`, `sc25`, and `tn36`; `tn36` clears two levels.
+This is up from 3/25 and 0.156 before online click semantics. The pre-defined
+public split is 4/17 clears on tuning games and 2/8 on the holdout, so the
+change is not confined to the games used for iteration, but the private
+competition score and all-games coverage remain unknown until Kaggle runs the
+notebook. It does not yet meet a 10-game target.
 
 Run the fast validation checks from the repository root:
 
@@ -156,6 +159,6 @@ To build the experimental human-mind Kaggle notebook from the known v17 base:
 .venv\Scripts\python.exe tools\build_mind_notebook.py
 ```
 
-This produces `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v18-human-mind.ipynb`.
+This produces `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v19-level-solver.ipynb`.
 It is ready for a Kaggle experiment, but its remote score still requires an
 actual Kaggle run and must not be treated as proven in advance.

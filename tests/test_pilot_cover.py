@@ -68,6 +68,15 @@ class PilotCoverageTests(unittest.TestCase):
         self.assertIn((7, 5), pilot.tried_use)
         self.assertIsNone(pilot._use_frontier(frame, [4, 5], ["RIGHT", "SPACE"]))
 
+    def test_stalled_goal_route_yields_to_other_level_phases(self):
+        """A route that changed no informative state must not replay forever."""
+        pilot, frame = grounded_pilot()
+        pilot.goal_hint = {2}
+        frame[1, 4] = 2
+        pilot.stalls = 1
+
+        self.assertIsNone(pilot._execute(frame, [1, 2, 3, 4], ["UP", "DOWN", "LEFT", "RIGHT"]))
+
 
 if __name__ == "__main__":
     unittest.main()

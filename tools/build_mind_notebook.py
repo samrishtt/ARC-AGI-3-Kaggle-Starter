@@ -17,11 +17,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 NOTEBOOK_DIR = REPO / "1.33 scored in arc agi 3 competiotn in kaggle"
 DEFAULT_SOURCE = NOTEBOOK_DIR / "arc3-duck-v17-winning-model.ipynb"
-DEFAULT_OUTPUT = NOTEBOOK_DIR / "arc3-duck-v18-human-mind.ipynb"
+DEFAULT_OUTPUT = NOTEBOOK_DIR / "arc3-duck-v19-level-solver.ipynb"
 # Keep this in dependency order: notebook cells run top-to-bottom and the pilot
 # imports Progress at module import time.  Omitting it lets the notebook build
 # and parse but fails only when Kaggle imports ``arc3x.pilot``.
-MODULES = ("percept", "mind", "progress", "mindgraft", "pilot", "autopilot")
+MODULES = ("percept", "mind", "progress", "mindgraft", "clicks", "pilot", "autopilot")
 
 
 def source(cell: dict) -> str:
@@ -43,7 +43,7 @@ def code(text: str) -> dict:
     }
 
 
-ARM = '''# ARC3 human-mind pilot (v18 experimental)
+ARM = '''# ARC3 human-mind level solver (v19 experimental)
 #
 # The pilot reads only the runtime state and valid action names already supplied
 # to the analyzer. It batches only model-backed actions; otherwise the wrapped
@@ -60,13 +60,13 @@ else:
 '''
 
 
-NOTE = """## 6c. ARC3 human-mind pilot (experimental)
+NOTE = """## 6c. ARC3 human-mind level solver (experimental)
 
 This build embeds the history-only mechanics learner, imagination model, cell
-sense, and fail-open acting wrapper. The pilot may batch a short route when the
-learned model verifies it; otherwise the original model receives the turn. This
-is an experiment, not a claim of a solved competition: only a Kaggle run can
-measure the remote gateway result.
+sense, online click-semantics model, and fail-open acting wrapper. The pilot may
+batch a short route or a learned click rule; otherwise the original model receives
+the turn. This is an experiment, not a claim of a solved competition: only a
+Kaggle run can measure the remote gateway result.
 """
 
 
