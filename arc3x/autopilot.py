@@ -118,6 +118,20 @@ def _flag(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _int_flag(name: str, default: int) -> int:
+    """A bounded integer setting that cannot turn a malformed env var into policy."""
+    try:
+        return max(0, int(os.environ.get(name, str(default)).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _pilot_mode() -> str:
+    """``active`` retains v19 behavior; ``sidecar`` protects an existing policy."""
+    mode = os.environ.get("ARC3X_PILOT_MODE", "active").strip().lower()
+    return mode if mode in {"active", "sidecar"} else "active"
+
+
 @dataclass
 class Autopilot:
     """Wraps one analyzer. ``__call__`` has ``analyze``'s exact signature.
@@ -155,7 +169,7 @@ class Autopilot:
         plan = None
         if step_env is not None and _flag("ARC3X_PILOT"):
             try:
-                plan = self._think(state_path, valid_actions)
+                plan = self._think(state_path, valid_actions, sidecar=_pilot_mode() == "sidecar")
             except Exception as exc:
                 # A pilot crash must cost one stock turn, never the game. This is
                 # the whole reason the wrapper is a wrapper.
@@ -197,7 +211,9 @@ class Autopilot:
 
     # -- the pilot's two inputs -----------------------------------------------
 
-    def _think(self, state_path: Any, valid_actions: Sequence[str] | None):
+    def _think(
+        self, state_path: Any, valid_actions: Sequence[str] | None, *, sidecar: bool = False
+    ):
         """Read the runtime state the solver just wrote, and decide.
 
         ``load_runtime_state`` is imported here rather than at module scope so this
@@ -214,6 +230,18 @@ class Autopilot:
             return None
         level = int(getattr(frame, "level", 1) or 1)
         self.pilot.observe(history)
+        if sidecar:
+            minimum = _int_flag("ARC3X_PILOT_MIN_HISTORY", 24)
+            if len(history) < minimum:
+                self._note(f"sidecar observing {len(history)}/{minimum} history entries")
+                return None
+            return self.pilot.assist(
+                grid,
+                valid_actions,
+                level,
+                spent_on_level=_on_level(history, level),
+                max_actions=_int_flag("ARC3X_PILOT_SIDECAR_ACTIONS", 4),
+            )
         return self.pilot.decide(
             grid, valid_actions, level, spent_on_level=_on_level(history, level)
         )

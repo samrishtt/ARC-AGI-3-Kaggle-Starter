@@ -68,6 +68,29 @@ class PilotClickTests(unittest.TestCase):
         first = plan.presses[0]
         self.assertEqual(int(frame[first.row, first.col]), 7)
 
+    def test_sidecar_only_replays_a_high_confidence_coordinate_free_click(self):
+        """The baseline-protecting mode never starts ordinary click exploration."""
+        pilot = Pilot()
+        frame = np.zeros((8, 10), dtype=np.int16)
+
+        self.assertIsNone(pilot.assist(frame, ["MOUSE"], 1, max_actions=4))
+
+        pilot.click_model.n = 4
+        pilot.click_model.support = Counter({"widget": 4})
+        pilot.click_model.follow = [
+            (0, 0, 4.0, 4.0),
+            (1, 1, 4.0, 4.0),
+            (2, 2, 4.0, 4.0),
+            (3, 3, 4.0, 4.0),
+        ]
+        plan = pilot.assist(frame, ["MOUSE"], 1, max_actions=4)
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.phase, "sidecar-step")
+        self.assertEqual(len(plan.presses), 1)
+        self.assertEqual(pilot.sidecar_actions, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

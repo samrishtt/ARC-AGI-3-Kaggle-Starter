@@ -377,6 +377,10 @@ class Pilot:
     keys: set[bytes] = field(default_factory=set)
     stalls: int = 0
     conceded: bool = False
+    #: Actions emitted by the conservative sidecar on this level.  The sidecar
+    #: is designed to preserve a competent language-model policy, so it may
+    #: confirm a learned rule a few times but never take ownership of a level.
+    sidecar_actions: int = 0
     #: Cursor into ``history`` for click attribution. Separate from
     #: ``Mind.seen``, which counts transitions rather than entries.
     _hist_seen: int = 0
@@ -530,6 +534,82 @@ class Pilot:
                 self.log.append(f"L{level} +{len(plan)}a {plan!r}")
                 return plan
         return self._hand("model has no move it can stand behind")
+
+    def assist(
+        self,
+        frame: np.ndarray,
+        valid: Sequence[str] | None,
+        level: int,
+        *,
+        spent_on_level: int | None = None,
+        max_actions: int = 4,
+    ) -> Plan | None:
+        """Return only a high-confidence action that complements an LLM policy.
+
+        This is deliberately much narrower than :meth:`decide`.  An LLM that has
+        already shown it can solve a game should retain its early exploratory
+        turns; replacing those turns with our blind grounding, coverage, and
+        click batches is a regression risk, not an improvement.  The sidecar
+        therefore acts only when it can reuse a fact that survived a prior level:
+
+        * a shortest movement route to a colour that previously completed one;
+        * a coordinate-free click action induced from at least four observations.
+
+        Each intervention is one action and the total is capped per level.  The
+        calling wrapper first waits for a history window, so the model is learned
+        from the language model's own actions rather than taking an opening turn.
+        """
+        if frame is None or getattr(frame, "ndim", 0) != 2 or not frame.size:
+            return None
+        self._roll(level, spent_on_level)
+        if self.sidecar_actions >= max(0, int(max_actions)):
+            return None
+        aids = self._aids(valid)
+        if not aids:
+            return None
+
+        self.mind.mech.where(frame)
+
+        # ``goal_colors`` is the only objective source here because it records a
+        # *completed* level.  Progress and visible rarity are useful laboratory
+        # hypotheses but are not strong enough to pre-empt the base policy.
+        proven = {
+            int(c)
+            for c, n in self.mind.mech.goal_colors.items()
+            if n > 0 and int(c) != self.mind.mech.background
+        }
+        if proven:
+            route = self._verified(frame, self.mind.route(frame, self._cells(frame, proven)))
+            if route:
+                plan = Plan(
+                    [self._press(route[0], valid)],
+                    "sidecar-route",
+                    f"one verified step toward learned goal {sorted(proven)}",
+                )
+                return self._record_sidecar(plan)
+
+        # A step rule is the one click interpretation that transfers even when a
+        # level redraws every object: the model has learned that coordinates are
+        # ignored.  It is intentionally a single confirmation, never a click
+        # search, and needs higher confidence than the active laboratory policy.
+        kind, confidence = self.click_model.verdict()
+        if CLICK_AID in aids and kind == "step" and confidence >= 0.9:
+            h, w = frame.shape
+            plan = Plan(
+                [self._press(CLICK_AID, valid, row=h // 2, col=w // 2)],
+                "sidecar-step",
+                f"one coordinate-free click at {confidence:.0%} confidence",
+            )
+            return self._record_sidecar(plan)
+        return None
+
+    def _record_sidecar(self, plan: Plan) -> Plan:
+        """Account for one conservative intervention exactly as ``decide`` does."""
+        self.sidecar_actions += len(plan)
+        self.spent += len(plan)
+        self.batches += 1
+        self.log.append(f"L{self.level} +{len(plan)}a {plan!r}")
+        return plan
 
     # -- phases ---------------------------------------------------------------
 
@@ -1105,6 +1185,7 @@ class Pilot:
         self.keys.clear()
         self.stalls = 0
         self.conceded = False
+        self.sidecar_actions = 0
 
     def _hand(self, why: str) -> None:
         self.handoffs += 1

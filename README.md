@@ -159,6 +159,18 @@ To build the experimental human-mind Kaggle notebook from the known v17 base:
 .venv\Scripts\python.exe tools\build_mind_notebook.py
 ```
 
-This produces `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v19-level-solver.ipynb`.
-It is ready for a Kaggle experiment, but its remote score still requires an
-actual Kaggle run and must not be treated as proven in advance.
+This produces two notebooks:
+
+- `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v20-v12-baseline-safety.ipynb`
+  is code-identical to the v12 benchmark configuration, with only historic
+  execution outputs cleared. Use this if maintaining the measured 2.14 private
+  baseline is the priority.
+- `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v20-v12-sidecar.ipynb`
+  retains the same v12 Qwen3.8 model attachment metadata and source-bundle
+  configuration, and adds a cautious sidecar after the first 24 observed
+  transitions. The sidecar is limited to four single-action, high-confidence
+  interventions per level and has no dependency on the later `taaf_grafts`
+  import, which failed in the recorded v15 run.
+
+The sidecar's private score remains unmeasured and must not be treated as an
+improvement in advance.
