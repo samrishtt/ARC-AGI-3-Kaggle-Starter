@@ -75,12 +75,14 @@ have against a remote gateway on a game nobody has played.
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import numpy as np
 
 from arc3x.clicks import ClickModel
+from arc3x.dream import Dream
 from arc3x.mindgraft import (
     AID_LABEL,
     CLICK_AID,
@@ -317,6 +319,12 @@ class Pilot:
     # wholesale on purpose (see agent.on_new_level, which had the same intent and
     # was never exercised because almost nothing cleared level 0).
     mind: Mind = field(default_factory=Mind)
+    #: A runnable, self-grading copy of the currently observed game.  It shares
+    #: ``mind.mech`` rather than attempting to infer a second set of controls:
+    #: history first updates the dream's accuracy ledger, then the mechanics
+    #: learner incorporates that very transition.  A proposed route may leave
+    #: the dream only after it has been predictive on held-out real actions.
+    dream: Dream = field(init=False)
     sense: CellSense = field(default_factory=CellSense)
     #: A separate model for the coordinate-dependent ACTION6.  `Mechanics`
     #: correctly refuses to pretend that a click has one fixed displacement;
@@ -381,6 +389,10 @@ class Pilot:
     #: is designed to preserve a competent language-model policy, so it may
     #: confirm a learned rule a few times but never take ownership of a level.
     sidecar_actions: int = 0
+    #: History cursor for the dream.  This is deliberately separate from the
+    #: mechanics cursor: the dream must grade its prediction *before* the
+    #: mechanics model sees the answer.
+    _dream_seen: int = 0
     #: Cursor into ``history`` for click attribution. Separate from
     #: ``Mind.seen``, which counts transitions rather than entries.
     _hist_seen: int = 0
@@ -391,9 +403,24 @@ class Pilot:
     handoffs: int = 0
     log: list[str] = field(default_factory=list)
 
+    #: Bounded free-search budget.  The depth is a mental horizon, not an action
+    #: allowance; sidecar mode still executes at most one planned action at a
+    #: time and re-plans after observing reality.
+    imagine_nodes: int = 1024
+    imagine_depth: int = 32
+    #: Mental planning telemetry.  Kept per game so a diagnostic can distinguish
+    #: "the copy had no confidence" from "it was confident but saw no useful
+    #: route"; those cases require different research work.
+    imagine_checks: int = 0
+    imagine_plans: int = 0
+    imagine_rejections: Counter = field(default_factory=Counter)
+
+    def __post_init__(self) -> None:
+        self.dream = Dream(self.mind.mech)
+
     # -- learning -------------------------------------------------------------
 
-    def observe(self, history: Sequence[Any]) -> int:
+    def observe(self, history: Sequence[Any], *, observe_dream: bool = True) -> int:
         """Fold new history into the mind, the cell key, and the click memory.
 
         Cheap by construction, and it has to be: this runs between the agent and
@@ -401,6 +428,38 @@ class Pilot:
         are incremental against their own cursor, so handing over the whole
         3,000-entry history every turn costs only what is new.
         """
+        # Grade the world model against each new real transition before adding
+        # that transition to ``Mechanics``.  Doing this after ``absorb`` would
+        # let the model mark itself correct using information it did not have
+        # when it would have made the prediction.  Scene cuts and resets are not
+        # action effects, so they reset only the dream's per-board comparison.
+        #
+        # v20's conservative sidecar deliberately passes ``False`` here.  It is
+        # a clean control for v21: no new observation work and no mental-policy
+        # effect is permitted merely because both notebooks embed the package.
+        if observe_dream:
+            for i in range(max(1, self._dream_seen), len(history)):
+                before_entry, after_entry = history[i - 1], history[i]
+                before, after = _grid(before_entry), _grid(after_entry)
+                if before is None or after is None or before.shape != after.shape:
+                    continue
+                before_frame = getattr(before_entry, "frame", None)
+                after_frame = getattr(after_entry, "frame", None)
+                before_level = int(getattr(before_frame, "level", -1) or -1)
+                after_level = int(getattr(after_frame, "level", -1) or -1)
+                if is_reset(getattr(after_entry, "action", None)) or after_level != before_level:
+                    self.dream.cut()
+                    continue
+                press = parse_press(getattr(after_entry, "action", None))
+                if press is not None:
+                    # ``locate`` is the prediction's observation of where the
+                    # sprite is now. The wrapped LLM may have made the preceding
+                    # action, so its position cannot be assumed to equal the last
+                    # pilot plan.
+                    self.mind.mech.where(before)
+                    self.dream.observe(press.aid, before, after)
+            self._dream_seen = len(history)
+
         fresh = self.mind.absorb(history)
         self.sense.absorb(history)
 
@@ -462,6 +521,11 @@ class Pilot:
                 click_events.append((before, after, press))
         self.click_model.learn_volatile(pairs)
         for before, after, press in click_events:
+            # Score only a rule that existed before this click teaches it.  The
+            # classifier may then absorb the event below, so later clicks are a
+            # proper held-out test instead of a self-fulfilling prediction.
+            predicted = self.click_model.predict(before, press.row, press.col)
+            self.click_model.grade(before, predicted, after)
             tags = self.click_model.observe(before, after, press.row, press.col)
             if tags and tags != "inert":
                 self.live_clicks.add((press.row, press.col))
@@ -522,9 +586,9 @@ class Pilot:
             self.log.append(f"L{level}: conceded to laboratory after {self.stalls} repeats")
 
         order = (
-            (self._ground, self._execute, self._use_frontier, self._cover, self._frontier, self._use, self._click)
+            (self._ground, self._imagine, self._execute, self._use_frontier, self._cover, self._frontier, self._use, self._click)
             if self._lab
-            else (self._execute, self._frontier, self._use, self._click, self._ground)
+            else (self._imagine, self._execute, self._frontier, self._use, self._click, self._ground)
         )
         for phase in order:
             plan = phase(frame, aids, valid)
@@ -543,6 +607,7 @@ class Pilot:
         *,
         spent_on_level: int | None = None,
         max_actions: int = 4,
+        allow_imagination: bool = False,
     ) -> Plan | None:
         """Return only a high-confidence action that complements an LLM policy.
 
@@ -569,6 +634,19 @@ class Pilot:
             return None
 
         self.mind.mech.where(frame)
+
+        # Mental mode takes a single step from a complete, self-verified plan.
+        # It remains opt-in because v20 is a measured conservative sidecar: the
+        # original sidecar must stay a clean A/B control for the new planner.
+        if allow_imagination:
+            imagined = self._imagined_plan(frame, aids, valid)
+            if imagined:
+                plan = Plan(
+                    [imagined.presses[0]],
+                    "sidecar-imagine",
+                    f"one step of {imagined.why}; observe and re-plan",
+                )
+                return self._record_sidecar(plan)
 
         # ``goal_colors`` is the only objective source here because it records a
         # *completed* level.  Progress and visible rarity are useful laboratory
@@ -601,6 +679,131 @@ class Pilot:
                 f"one coordinate-free click at {confidence:.0%} confidence",
             )
             return self._record_sidecar(plan)
+        return None
+
+    def _imagine(
+        self, frame: np.ndarray, aids: list[int], valid: Sequence[str] | None
+    ) -> Plan | None:
+        """Execute a short prefix of a plan first solved inside the dream.
+
+        The dream searches entirely in predicted frames.  This method only emits
+        a route if all of the following are true: the model has enough held-out
+        movement predictions, the whole candidate route rolls out without an
+        abstention, and that rollout reduces the objective the dream learned from
+        prior play.  It therefore implements the intended loop of *observe,
+        hypothesise, simulate, act*, rather than treating a shortest path as a
+        mental model by name alone.
+        """
+        plan = self._imagined_plan(frame, aids, valid)
+        if plan is None:
+            return None
+        prefix = plan.presses[: self._cap]
+        if not prefix:
+            return None
+        return Plan(prefix, "imagine", plan.why)
+
+    def _imagined_plan(
+        self, frame: np.ndarray, aids: list[int], valid: Sequence[str] | None
+    ) -> Plan | None:
+        """Return a complete simulated plan, but spend no action here."""
+        self.imagine_checks += 1
+        start = self.dream.objective(frame)
+        if start is None:
+            self.imagine_rejections["no-objective"] += 1
+            return None
+
+        # Click-only games have no translating avatar, so their forward model
+        # cannot meet ``Dream.confident`` by definition. A separately validated
+        # paint/teleport rule is the equivalent evidence: mentally try each
+        # credible click, then act only when its predicted frame lowers the same
+        # learned objective as a movement rollout would.
+        click_plan = self._imagined_click_plan(frame, aids, valid, start)
+        if click_plan is not None:
+            self.imagine_plans += 1
+            return click_plan
+
+        if not self.dream.confident:
+            self.imagine_rejections["unconfident"] += 1
+            return None
+        route = self.dream.route(
+            frame,
+            max_nodes=max(1, int(self.imagine_nodes)),
+            max_depth=max(1, int(self.imagine_depth)),
+        )
+        if not route or any(aid not in aids for aid in route):
+            self.imagine_rejections["no-route"] += 1
+            return None
+        predicted = self.dream.rollout(frame, route)
+        if predicted is None:
+            self.imagine_rejections["rollout-abstained"] += 1
+            return None
+        finish = self.dream.objective(predicted)
+        if finish is None or finish >= start:
+            self.imagine_rejections["no-improvement"] += 1
+            return None
+        self.imagine_plans += 1
+        return Plan(
+            [self._press(aid, valid) for aid in route],
+            "imagine",
+            f"{len(route)}a simulated objective {start}->{finish} at {self.dream.acc_move:.0%}",
+        )
+
+    def _imagined_click_plan(
+        self,
+        frame: np.ndarray,
+        aids: list[int],
+        valid: Sequence[str] | None,
+        start: int,
+    ) -> Plan | None:
+        """Return one click whose learned forward effect improves the objective.
+
+        This is deliberately not a coordinate sweep. Candidates come first from
+        colours with objective or prior click-response evidence, then from small
+        visible objects. A predicted action must still lower the objective, so a
+        confident paint/teleport rule alone never licenses aimless clicking.
+        """
+        if CLICK_AID not in aids or not self.click_model.predictive:
+            return None
+        kind, _confidence = self.click_model.verdict()
+        if kind not in {"paint", "teleport"}:
+            return None
+
+        candidates: list[tuple[int, int]] = []
+
+        def add(cells: Sequence[tuple[int, int]], limit: int) -> None:
+            for cell in self._spread(cells, limit):
+                if cell not in candidates and cell not in self.clicked:
+                    candidates.append(cell)
+
+        counts = self._counts(frame)
+        for color in sorted(self._goal_colors(frame), key=lambda c: counts.get(c, frame.size)):
+            add(self._cells(frame, {color}), self.clicks_per_color)
+        for color in self.click_model.clickable(frame):
+            add(self._cells(frame, {color}), self.clicks_per_color)
+        # A proven spatial model can test a compact unusual object, but never an
+        # unbounded canvas. This is only a candidate generator; prediction plus
+        # objective improvement remain the action gate.
+        background = self.mind.mech.background
+        for color in sorted(counts, key=lambda c: counts[c]):
+            if len(candidates) >= self.click_batch:
+                break
+            if color == background or counts[color] >= frame.size // 4:
+                continue
+            add(self._cells(frame, {color}), self.clicks_per_color)
+
+        for row, col in candidates[: self.click_batch]:
+            predicted = self.click_model.predict(frame, row, col)
+            if predicted is None:
+                continue
+            finish = self.dream.objective(predicted)
+            if finish is not None and finish < start:
+                return Plan(
+                    [self._press(CLICK_AID, valid, row=row, col=col)],
+                    "imagine-click",
+                    f"{kind} simulated objective {start}->{finish} at "
+                    f"{self.click_model.prediction_accuracy:.0%}",
+                )
+        self.imagine_rejections["click-no-improvement"] += 1
         return None
 
     def _record_sidecar(self, plan: Plan) -> Plan:
@@ -1186,6 +1389,7 @@ class Pilot:
         self.stalls = 0
         self.conceded = False
         self.sidecar_actions = 0
+        self.dream.cut()
 
     def _hand(self, why: str) -> None:
         self.handoffs += 1
@@ -1228,5 +1432,7 @@ class Pilot:
             f"L{self.level} spent={self.spent} lab={self._lab} grounded={self._grounded} "
             f"batches={self.batches} handoffs={self.handoffs} "
             f"cell={self.sense.n_varying - self.sense.n_clock}/{self.sense.n_varying}px "
-            f"| {self.mind.summary()}"
+            f"mental={self.imagine_plans}/{self.imagine_checks} "
+            f"reject={dict(self.imagine_rejections)} "
+            f"| {self.dream.summary()} | {self.mind.summary()}"
         )

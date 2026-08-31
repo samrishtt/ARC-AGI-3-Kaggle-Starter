@@ -55,7 +55,7 @@ The agent is built on the [Tufa Labs TAAF framework](https://www.kaggle.com/data
 
 Each graft is individually flag-gated, blanket-guarded (any error degrades to stock behavior), and composable via the `composite.install(bm, flags={})` entry point.
 
-### Current v20 submission path
+### Current v20/v21 submission paths
 
 The diagram above describes the historical graft research. The active Kaggle
 candidate keeps the exact, measured v12 Qwen run as its primary planner and
@@ -71,12 +71,19 @@ online world model ──► movement + passability + click semantics + HUD filt
         └── otherwise: return control to Qwen unchanged
 ```
 
-The sidecar waits for at least 24 history entries, then learns only from
+The v20 sidecar waits for at least 24 history entries, then learns only from
 observed transitions. At level boundaries it retains stable mechanics but clears
 board-specific state. It can act only when it has strong evidence from an
 earlier completed level: replaying a route toward a proven goal color, or
-issuing one central click after a high-confidence `step` classification. The
-purpose is transferable causal knowledge, not a hard-coded public-game solver.
+issuing one central click after a high-confidence `step` classification.
+
+The separate v21 candidate adds the intended mental loop: it grades a learned
+forward model against real, held-out movement transitions; searches candidate
+routes in that model for free; and intervenes only if a complete rollout lowers
+a learned objective. It then executes **one** predicted action, observes its
+outcome, and re-plans. v20 skips even this mental-model observation path, so it
+remains the conservative control. Neither candidate is a claim of private-score
+improvement until independently submitted to Kaggle.
 
 ## Repository Structure
 
@@ -101,6 +108,7 @@ purpose is transferable causal knowledge, not a hard-coded public-game solver.
 │   ├── percept.py            # Frame deltas, object masks, HUD filtering
 │   ├── mind.py               # Movement and passability hypotheses
 │   ├── clicks.py             # Learned click semantics
+│   ├── dream.py              # Self-grading forward model and free rollouts
 │   └── autopilot.py          # Conservative Qwen-compatible controller
 ├── tools/                    # Notebook build and validation tooling
 ├── create_experiment_notebook.py  # Automated notebook generator for experiments A-E
@@ -181,13 +189,13 @@ $env:PYTHONPATH = "."
 The full scored suite is intentionally separate because it is CPU-intensive:
 `arc3x\suite.py --split both -w 10 --budget 3000`.
 
-To regenerate the v20 Kaggle notebooks from the known 2.14-scoring v12 base:
+To regenerate the v20/v21 Kaggle notebooks from the known 2.14-scoring v12 base:
 
 ```powershell
 .venv\Scripts\python.exe tools\build_mind_notebook.py
 ```
 
-This produces two notebooks:
+This produces three notebooks:
 
 - `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v20-v12-baseline-safety.ipynb`
   is code-identical to the v12 benchmark configuration, with only historic
@@ -199,12 +207,29 @@ This produces two notebooks:
   transitions. The sidecar is limited to four single-action, high-confidence
   interventions per level and has no dependency on the later `taaf_grafts`
   import, which failed in the recorded v15 run.
+- `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v21-v12-mental-simulation.ipynb`
+  is the separate mental-simulation experiment. It preserves Qwen's opening,
+  requires either eight held-out movement predictions or four held-out
+  paint/teleport click predictions at >=80% accuracy, and executes only the
+  first action of an objective-improving simulated plan before observing and
+  re-planning.
 
 The known private Kaggle score for v12 is **2.14**. The separate 5.04 value is
 an offline six-game, four-pass diagnostic mean, not a private-leaderboard
 result. The sidecar's private score remains unmeasured and must not be treated
 as an improvement in advance. Submit the source-equivalent safety notebook
-first, then run the sidecar as an explicit A/B experiment.
+first, then run v20 and v21 as separate A/B experiments.
+
+For a local, no-LLM diagnostic of the production `Pilot` path (not comparable
+to Qwen or Kaggle scoring), run:
+
+```powershell
+.venv\Scripts\python.exe arc3x\pilot_harness.py tn36 --budget 300
+```
+
+It records how often the mental model has enough held-out predictive evidence,
+how often it finds an internal plan, and why it abstains. This is the correct
+place to improve observation/model learning before loosening the action gate.
 
 ## Kaggle submission description (623/750 characters)
 

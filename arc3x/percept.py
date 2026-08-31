@@ -337,13 +337,26 @@ class Volatility:
     observed: int = 0
 
     def add(self, before: np.ndarray, after: np.ndarray) -> None:
+        """Record one same-shaped transition, restarting on a new board shape.
+
+        Kaggle games currently render at ``GRID`` square pixels, but the online
+        pilot and its offline harness intentionally accept smaller boards.  A
+        transition from a differently shaped level has no pixelwise meaning, so
+        it is safer to begin a fresh volatility ledger than to broadcast a stale
+        64x64 HUD mask (or silently count unrelated pixels as a clock).
+        """
+        if before.shape != after.shape:
+            return
+        if self.changes.shape != before.shape:
+            self.changes = np.zeros(before.shape, dtype=np.int32)
+            self.observed = 0
         self.changes += (before != after).astype(np.int32)
         self.observed += 1
 
     def hud_mask(self, thresh: float = 0.9) -> np.ndarray:
         """Pixels that change almost every action: a counter, not the world."""
         if self.observed < 8:
-            return np.zeros((GRID, GRID), dtype=bool)
+            return np.zeros(self.changes.shape, dtype=bool)
         return self.changes >= max(1, int(thresh * self.observed))
 
     def static_mask(self) -> np.ndarray:

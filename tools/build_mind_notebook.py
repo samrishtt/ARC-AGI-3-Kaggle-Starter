@@ -1,4 +1,4 @@
-"""Build a v12-baseline Kaggle notebook with a conservative ARC3 sidecar armed.
+"""Build v12-derived ARC3 control and mental-simulation Kaggle notebooks.
 
 This intentionally starts from the exact v12 notebook that scored 2.14 on the
 private Kaggle submission.  It embeds the local mind stack immediately before
@@ -19,10 +19,11 @@ NOTEBOOK_DIR = REPO / "1.33 scored in arc agi 3 competiotn in kaggle"
 DEFAULT_SOURCE = NOTEBOOK_DIR / "arc3-duck-v12-with-qwen-3-8-27b this one scored 2.14 .ipynb"
 DEFAULT_OUTPUT = NOTEBOOK_DIR / "arc3-duck-v20-v12-sidecar.ipynb"
 DEFAULT_SAFETY_OUTPUT = NOTEBOOK_DIR / "arc3-duck-v20-v12-baseline-safety.ipynb"
+DEFAULT_MENTAL_OUTPUT = NOTEBOOK_DIR / "arc3-duck-v21-v12-mental-simulation.ipynb"
 # Keep this in dependency order: notebook cells run top-to-bottom and the pilot
 # imports Progress at module import time.  Omitting it lets the notebook build
 # and parse but fails only when Kaggle imports ``arc3x.pilot``.
-MODULES = ("percept", "mind", "progress", "mindgraft", "clicks", "pilot", "autopilot")
+MODULES = ("percept", "mind", "progress", "dream", "mindgraft", "clicks", "pilot", "autopilot")
 
 
 def source(cell: dict) -> str:
@@ -44,7 +45,7 @@ def code(text: str) -> dict:
     }
 
 
-ARM = '''# ARC3 conservative level-solver sidecar (v20)
+SIDECAR_ARM = '''# ARC3 conservative level-solver sidecar (v20)
 #
 # Preserve the v12 Qwen policy's opening.  After it has supplied a meaningful
 # transition history, the sidecar may contribute one action only when it can
@@ -70,7 +71,7 @@ else:
 '''
 
 
-NOTE = """## 6c. Conservative ARC3 level-solver sidecar (experimental)
+SIDECAR_NOTE = """## 6c. Conservative ARC3 level-solver sidecar (experimental)
 
 This build is based on the exact v12 private-score baseline. It embeds a
 history-only mechanics learner, online click-semantics model, and fail-open
@@ -82,7 +83,53 @@ measure any private-score change.
 """
 
 
-def build(source_path: Path, output_path: Path, *, include_sidecar: bool = True) -> None:
+MENTAL_ARM = '''# ARC3 mental-simulation sidecar (v21)
+#
+# This is a separately scored experimental candidate. Qwen retains the opening;
+# the sidecar acts only after it has learned from real transitions, verified its
+# movement predictions on held-out actions, and found a complete imagined route
+# that lowers a learned objective. It executes one action, observes, then plans
+# again rather than committing an unobserved route.
+import os
+import sys
+
+os.environ["ARC3X_PILOT"] = "1"
+os.environ["ARC3X_PILOT_MODE"] = "mental"
+os.environ["ARC3X_PILOT_MIN_HISTORY"] = "24"
+os.environ["ARC3X_PILOT_SIDECAR_ACTIONS"] = "4"
+if "/kaggle/working" not in sys.path:
+    sys.path.insert(0, "/kaggle/working")
+from arc3x.autopilot import arm
+
+if arm():
+    print("arc3x v21 mental-simulation sidecar armed; Qwen keeps the opening")
+else:
+    print("arc3x v21 sidecar was not armed; continuing with the v12 baseline")
+'''
+
+
+MENTAL_NOTE = """## 6d. Mental-simulation sidecar (experimental v21)
+
+This separate candidate implements the full observe -> predict -> simulate ->
+execute loop. It first watches Qwen's real action/frame transitions and learns
+movement, passability, click effects, goals, and UI volatility. It can intervene
+only when either its movement copy is accurate on at least eight held-out moves,
+or a paint/teleport click model is accurate on four later click effects; a free
+rollout must also lower a learned objective. It executes only the first action,
+observes the result, and replans. The v20 sidecar and source-equivalent v12
+safety notebook remain controls; this notebook requires Kaggle A/B measurement.
+"""
+
+
+def build(
+    source_path: Path,
+    output_path: Path,
+    *,
+    include_sidecar: bool = True,
+    arm: str = SIDECAR_ARM,
+    note: str = SIDECAR_NOTE,
+    kind: str = "sidecar",
+) -> None:
     notebook = json.loads(source_path.read_text(encoding="utf-8"))
     cells = list(notebook.get("cells", []))
     if include_sidecar and any("arc3x human-mind pilot" in source(cell) for cell in cells):
@@ -113,7 +160,7 @@ def build(source_path: Path, output_path: Path, *, include_sidecar: bool = True)
         for name in MODULES:
             body = (REPO / "arc3x" / f"{name}.py").read_text(encoding="utf-8")
             injected.append(code(f"%%writefile /kaggle/working/arc3x/{name}.py\n{body}"))
-        injected.extend([markdown(NOTE), code(ARM)])
+        injected.extend([markdown(note), code(arm)])
         cells[run_index:run_index] = injected
     # Execution output from the historic v12 run is useful as evidence in the
     # repository, but should not be carried into a new Kaggle submission.  It
@@ -128,7 +175,7 @@ def build(source_path: Path, output_path: Path, *, include_sidecar: bool = True)
     if include_sidecar:
         for name in MODULES:
             ast.parse((REPO / "arc3x" / f"{name}.py").read_text(encoding="utf-8"))
-        arm_index = next(i for i, cell in enumerate(cells) if source(cell) == ARM)
+        arm_index = next(i for i, cell in enumerate(cells) if source(cell) == arm)
         if not any(
             "## 7. Run the benchmark" in source(cell)
             or "run_context = contextlib.nullcontext" in source(cell)
@@ -137,8 +184,8 @@ def build(source_path: Path, output_path: Path, *, include_sidecar: bool = True)
             raise SystemExit("pilot arm cell is not before the benchmark run")
 
     output_path.write_text(json.dumps(notebook, indent=1), encoding="utf-8")
-    kind = "sidecar" if include_sidecar else "baseline safety"
-    print(f"wrote {kind}: {output_path} ({len(cells)} cells, {output_path.stat().st_size / 1024:.0f} KB)")
+    label = kind if include_sidecar else "baseline safety"
+    print(f"wrote {label}: {output_path} ({len(cells)} cells, {output_path.stat().st_size / 1024:.0f} KB)")
 
 
 def main() -> None:
@@ -146,11 +193,21 @@ def main() -> None:
     parser.add_argument("--src", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--safety-out", type=Path, default=DEFAULT_SAFETY_OUTPUT)
-    parser.add_argument("--no-safety", action="store_true", help="build only the sidecar candidate")
+    parser.add_argument("--mental-out", type=Path, default=DEFAULT_MENTAL_OUTPUT)
+    parser.add_argument("--no-safety", action="store_true", help="skip the source-equivalent safety notebook")
+    parser.add_argument("--no-mental", action="store_true", help="skip the v21 mental-simulation candidate")
     args = parser.parse_args()
     build(args.src, args.out)
     if not args.no_safety:
         build(args.src, args.safety_out, include_sidecar=False)
+    if not args.no_mental:
+        build(
+            args.src,
+            args.mental_out,
+            arm=MENTAL_ARM,
+            note=MENTAL_NOTE,
+            kind="mental-simulation sidecar",
+        )
 
 
 if __name__ == "__main__":

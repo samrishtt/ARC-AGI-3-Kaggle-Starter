@@ -155,6 +155,14 @@ class ClickModel:
     # (anchor - click) -> hits.
     tele_shape: Counter = field(default_factory=Counter)
     tele_offset: Counter = field(default_factory=Counter)
+    # -- honesty ledger -------------------------------------------------
+    # A semantic label is not yet a model.  These count whether a prediction
+    # formed *before* a later click actually described the pixels it claimed
+    # would change.  The pilot uses this as the click analogue of Dream's held-
+    # out movement gate.
+    prediction_hits: int = 0
+    prediction_misses: int = 0
+    prediction_abstains: int = 0
 
     # -- pass 1 -----------------------------------------------------------
 
@@ -450,6 +458,46 @@ class ClickModel:
         if kind == "teleport":
             return self._predict_teleport(grid, r, c)
         return None
+
+    def grade(self, before: np.ndarray, predicted: np.ndarray | None, actual: np.ndarray) -> str:
+        """Score a pre-click prediction against the effect it specifically claims.
+
+        The comparison intentionally focuses on pixels the prediction says will
+        change. A forward model of a click need not reproduce an independent
+        animation or a countdown to be useful; it does need to be right about
+        the paint stroke or teleported sprite that licensed an action. Volatile
+        HUD pixels are excluded using evidence accumulated from earlier frames.
+        """
+        if (
+            predicted is None
+            or before.shape != actual.shape
+            or predicted.shape != before.shape
+        ):
+            self.prediction_abstains += 1
+            return "abstain"
+        focus = predicted != before
+        volatile = self.volatile
+        if volatile is not None and volatile.shape == focus.shape:
+            focus &= ~volatile
+        if not focus.any():
+            self.prediction_abstains += 1
+            return "abstain"
+        if bool(np.array_equal(predicted[focus], actual[focus])):
+            self.prediction_hits += 1
+            return "hit"
+        self.prediction_misses += 1
+        return "miss"
+
+    @property
+    def predictive(self) -> bool:
+        """Whether click predictions have earned the right to guide v21 plans."""
+        judged = self.prediction_hits + self.prediction_misses
+        return judged >= MIN_CLICKS and self.prediction_hits >= 0.8 * judged
+
+    @property
+    def prediction_accuracy(self) -> float:
+        judged = self.prediction_hits + self.prediction_misses
+        return self.prediction_hits / judged if judged else 0.0
 
     def _predict_teleport(self, grid: np.ndarray, r: int, c: int) -> np.ndarray | None:
         """Lift the sprite out of where it is and stamp it at the click.

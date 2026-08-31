@@ -127,9 +127,14 @@ def _int_flag(name: str, default: int) -> int:
 
 
 def _pilot_mode() -> str:
-    """``active`` retains v19 behavior; ``sidecar`` protects an existing policy."""
+    """Select autonomous, conservative, or mentally planned control.
+
+    ``sidecar`` is the frozen v20 A/B control. ``mental`` permits the new
+    self-verified imagination step while retaining the same observation window,
+    one-action execution, and per-level action cap.
+    """
     mode = os.environ.get("ARC3X_PILOT_MODE", "active").strip().lower()
-    return mode if mode in {"active", "sidecar"} else "active"
+    return mode if mode in {"active", "sidecar", "mental"} else "active"
 
 
 @dataclass
@@ -169,7 +174,8 @@ class Autopilot:
         plan = None
         if step_env is not None and _flag("ARC3X_PILOT"):
             try:
-                plan = self._think(state_path, valid_actions, sidecar=_pilot_mode() == "sidecar")
+                mode = _pilot_mode()
+                plan = self._think(state_path, valid_actions, sidecar=mode != "active", mental=mode == "mental")
             except Exception as exc:
                 # A pilot crash must cost one stock turn, never the game. This is
                 # the whole reason the wrapper is a wrapper.
@@ -212,7 +218,12 @@ class Autopilot:
     # -- the pilot's two inputs -----------------------------------------------
 
     def _think(
-        self, state_path: Any, valid_actions: Sequence[str] | None, *, sidecar: bool = False
+        self,
+        state_path: Any,
+        valid_actions: Sequence[str] | None,
+        *,
+        sidecar: bool = False,
+        mental: bool = False,
     ):
         """Read the runtime state the solver just wrote, and decide.
 
@@ -229,7 +240,7 @@ class Autopilot:
         if grid.ndim != 2 or not grid.size:
             return None
         level = int(getattr(frame, "level", 1) or 1)
-        self.pilot.observe(history)
+        self.pilot.observe(history, observe_dream=not sidecar or mental)
         if sidecar:
             minimum = _int_flag("ARC3X_PILOT_MIN_HISTORY", 24)
             if len(history) < minimum:
@@ -241,6 +252,7 @@ class Autopilot:
                 level,
                 spent_on_level=_on_level(history, level),
                 max_actions=_int_flag("ARC3X_PILOT_SIDECAR_ACTIONS", 4),
+                allow_imagination=mental,
             )
         return self.pilot.decide(
             grid, valid_actions, level, spent_on_level=_on_level(history, level)
