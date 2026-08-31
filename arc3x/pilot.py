@@ -355,6 +355,15 @@ class Pilot:
     level: int = FIRST_LEVEL
     spent: int = 0
     tried: set[int] = field(default_factory=set)
+    #: Sprite cells reached on the current board.  Level 0 often has no visible
+    #: objective until the avatar walks onto it, so coverage is evidence rather
+    #: than a colour-specific guess.
+    visited: set[tuple[int, int]] = field(default_factory=set)
+    #: Context-sensitive use experiments already attempted on this board.  A
+    #: button can be inert in open space yet open a neighbouring door or operate
+    #: a switch, so this is keyed by both object colour and button, not button
+    #: alone.
+    tried_use: set[tuple[int, int]] = field(default_factory=set)
     clicked: set[tuple[int, int]] = field(default_factory=set)
     live_clicks: set[tuple[int, int]] = field(default_factory=set)
     acted: set[int] = field(default_factory=set)
@@ -474,6 +483,8 @@ class Pilot:
         # the largest same-coloured clump on the board and mistracks from there on
         # (measured in mindgraft.backtest: individual games swing 50 points).
         self.mind.mech.where(frame)
+        if self.mind.mech.pos is not None:
+            self.visited.add(self.mind.mech.pos)
 
         # Novelty, on the calibrated key rather than the raw frame - the whole
         # point of CellSense. A repeat is how a wall announces itself.
@@ -488,7 +499,7 @@ class Pilot:
             self.log.append(f"L{level}: conceded to laboratory after {self.stalls} repeats")
 
         order = (
-            (self._ground, self._execute, self._frontier, self._use, self._click)
+            (self._ground, self._execute, self._use_frontier, self._cover, self._frontier, self._use, self._click)
             if self._lab
             else (self._execute, self._frontier, self._use, self._click, self._ground)
         )
@@ -546,6 +557,103 @@ class Pilot:
         if not route:
             return None
         return Plan([self._press(a, valid) for a in route], "execute", f"->goal {len(route)}a")
+
+    def _cover(
+        self, frame: np.ndarray, aids: list[int], valid: Sequence[str] | None
+    ) -> Plan | None:
+        """Walk the learned-reachable map once when there is no reliable goal.
+
+        A first level is a laboratory: touching an unremarkable tile can reveal a
+        collectible, switch, exit, hazard, or a new objective colour.  This uses
+        only the learned movement map and positions that the agent has already
+        established as walkable.  It therefore transfers to an unseen game and
+        does not encode a colour, layout, or public game identity.
+        """
+        if not self._lab:
+            return None
+        routes = self.mind.mech.reachable(frame)
+        fresh = [
+            (len(route), cell, route)
+            for cell, route in routes.items()
+            if route and cell not in self.visited
+        ]
+        if not fresh:
+            return None
+        # Longest-first gives each bounded batch a new destination and avoids the
+        # local back-and-forth of choosing the nearest unexplored cell.
+        _n, cell, route = max(fresh, key=lambda item: (item[0], item[1]))
+        route = self._verified(frame, route)
+        if not route:
+            return None
+        self._remember_route(frame, route)
+        return Plan(
+            [self._press(a, valid) for a in route],
+            "cover",
+            f"->{cell} {len(route)}a",
+        )
+
+    def _use_frontier(
+        self, frame: np.ndarray, aids: list[int], valid: Sequence[str] | None
+    ) -> Plan | None:
+        """Try a non-movement button while adjacent to an untouched object.
+
+        An interaction button is frequently context-sensitive: pressing it in an
+        empty room teaches nothing, while pressing it next to a closed door,
+        switch, crate, or terminal can change the board.  The prior frontier
+        phase already puts the avatar at exactly those boundaries.  This method
+        turns that observation into one bounded experiment per ``(colour,
+        button)`` pair, with no assumptions about what either means.
+        """
+        mech = self.mind.mech
+        box = mech.locate(frame, hint=mech.pos)
+        if box is None:
+            return None
+        # Directions with an observed sprite displacement are navigation, not a
+        # context-sensitive use.  ``shifts`` excludes a direction whose delta
+        # could not yet be settled (for example a rotating sprite).
+        move_ids = set(mech.moves)
+        known = [a for a in mech.acts if a in aids and a != CLICK_AID]
+        other = [
+            a for a in aids
+            if a != CLICK_AID and a not in move_ids and not mech.shifts.get(a, 0)
+            and a not in known
+        ]
+        buttons = known + other
+        if not buttons:
+            return None
+
+        top, left, h, w = box
+        H, W = frame.shape
+        body = mech.body or {mech.avatar}
+        nearby: set[int] = set()
+        for dy, dx in mech.moves.values():
+            nt, nl = top + dy, left + dx
+            if nt < 0 or nl < 0 or nt + h > H or nl + w > W:
+                continue
+            nearby |= {int(c) for c in np.unique(frame[nt : nt + h, nl : nl + w])}
+        nearby -= {mech.background, *body}
+        # A colour that has already carried the sprite is ordinary ground until
+        # there is fresh blocking evidence; this stops use probes on every floor
+        # tile while retaining doors whose state has changed.
+        nearby = {
+            c for c in nearby
+            if not mech.passable.get(c, 0) or c in mech.blocked_set
+        }
+        if not nearby:
+            return None
+        counts = self._counts(frame)
+        for color in sorted(nearby, key=lambda c: (counts.get(c, 0), c)):
+            for aid in buttons:
+                pair = (color, aid)
+                if pair in self.tried_use:
+                    continue
+                self.tried_use.add(pair)
+                return Plan(
+                    [self._press(aid, valid)],
+                    "use-frontier",
+                    f"button {aid} at colour {color}",
+                )
+        return None
 
     def _frontier(
         self, frame: np.ndarray, aids: list[int], valid: Sequence[str] | None
@@ -751,6 +859,28 @@ class Pilot:
             return kept
         return kept + [route[-1]]
 
+    def _remember_route(self, frame: np.ndarray, route: Sequence[int]) -> None:
+        """Record the cells a coverage route is expected to traverse.
+
+        ``_cover`` selects only routes returned by ``reachable``, whose every
+        position is already known walkable.  Remembering the route keeps the next
+        coverage choice from simply retracing the same long corridor.  The next
+        observed frame still records the real location, so a level completion or
+        divergence cannot contaminate the following board.
+        """
+        box = self.mind.mech.locate(frame, hint=self.mind.mech.pos)
+        if box is None:
+            return
+        top, left, _h, _w = box
+        self.visited.add((top, left))
+        for aid in route:
+            delta = self.mind.mech.moves.get(aid)
+            if delta is None:
+                return
+            top += delta[0]
+            left += delta[1]
+            self.visited.add((top, left))
+
     # -- targets --------------------------------------------------------------
 
     def _goal_colors(self, frame: np.ndarray) -> set[int]:
@@ -863,6 +993,8 @@ class Pilot:
         self.level = level
         self.spent = 0 if spent_on_level is None else int(spent_on_level)
         self.tried.clear()
+        self.visited.clear()
+        self.tried_use.clear()
         self.clicked.clear()
         self.live_clicks.clear()
         self.acted.clear()

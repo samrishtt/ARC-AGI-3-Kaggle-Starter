@@ -18,7 +18,10 @@ REPO = Path(__file__).resolve().parent.parent
 NOTEBOOK_DIR = REPO / "1.33 scored in arc agi 3 competiotn in kaggle"
 DEFAULT_SOURCE = NOTEBOOK_DIR / "arc3-duck-v17-winning-model.ipynb"
 DEFAULT_OUTPUT = NOTEBOOK_DIR / "arc3-duck-v18-human-mind.ipynb"
-MODULES = ("percept", "mind", "mindgraft", "pilot", "autopilot")
+# Keep this in dependency order: notebook cells run top-to-bottom and the pilot
+# imports Progress at module import time.  Omitting it lets the notebook build
+# and parse but fails only when Kaggle imports ``arc3x.pilot``.
+MODULES = ("percept", "mind", "progress", "mindgraft", "pilot", "autopilot")
 
 
 def source(cell: dict) -> str:
@@ -80,7 +83,12 @@ def build(source_path: Path, output_path: Path) -> None:
     if run_index is None:
         raise SystemExit("could not locate the benchmark run cell")
 
-    injected = [markdown("## 6c. Embedded human-mind modules")]
+    injected = [
+        markdown("## 6c. Embedded human-mind modules"),
+        # ``%%writefile`` will not create missing parents.  The base notebook
+        # creates /kaggle/working but does not own an arc3x package directory.
+        code("from pathlib import Path\nPath('/kaggle/working/arc3x').mkdir(parents=True, exist_ok=True)"),
+    ]
     for name in MODULES:
         body = (REPO / "arc3x" / f"{name}.py").read_text(encoding="utf-8")
         injected.append(code(f"%%writefile /kaggle/working/arc3x/{name}.py\n{body}"))

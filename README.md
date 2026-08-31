@@ -123,12 +123,19 @@ from poisoning the previous level's internal model.
 ratchet down or up across ordinary play can become objective evidence without
 hard-coding a game or color. This is guarded against large floods and clock-like
 HUD counters, and has regression tests in `tests/test_progress_pilot.py`.
+On laboratory levels it now also covers the learned-reachable map and tries
+context-sensitive non-movement actions at adjacent unknown objects. Both rules
+use only observed controls, geometry, and transitions. Board-specific state is
+cleared at a level transition while the learned mechanics model is retained for
+the next level.
 
 The current local pilot benchmark is a development diagnostic, not a claim of
-general solving: the fixed 25-game public suite currently clears 1/25 games and
-scores 0.111 (the same result after the progress integration). The competition
-also evaluates private clones, so no private-set or all-games result is known
-until Kaggle runs the notebook.
+general solving: the fixed 25-game public suite currently clears level 0 in
+3/25 games and scores 0.156 under the 60-turn/3,000-action pilot harness,
+up from 1/25 and 0.111 before map coverage. One new clear (`m0r0`) is in the
+repository's pre-defined public holdout; this supports, but does not prove,
+generalisation. The competition's private score and all-games coverage remain
+unknown until Kaggle runs the notebook.
 
 Run the fast validation checks from the repository root:
 
