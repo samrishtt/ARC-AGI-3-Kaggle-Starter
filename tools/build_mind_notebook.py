@@ -50,11 +50,17 @@ ARM = '''# ARC3 conservative level-solver sidecar (v20)
 # transition history, the sidecar may contribute one action only when it can
 # reuse a completed-level goal or a high-confidence coordinate-free click rule.
 import os
+import sys
 
 os.environ["ARC3X_PILOT"] = "1"
 os.environ["ARC3X_PILOT_MODE"] = "sidecar"
 os.environ["ARC3X_PILOT_MIN_HISTORY"] = "24"
 os.environ["ARC3X_PILOT_SIDECAR_ACTIONS"] = "4"
+# The original v12 setup imports its TAAF source via a .pth file.  Make the
+# freshly-written /kaggle/working/arc3x package explicit as well, independent of
+# the notebook's current working directory.
+if "/kaggle/working" not in sys.path:
+    sys.path.insert(0, "/kaggle/working")
 from arc3x.autopilot import arm
 
 if arm():
