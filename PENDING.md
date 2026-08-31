@@ -2,6 +2,29 @@
 
 Last updated: 2026-08-31
 
+## Completed checkpoint
+
+The guarded mental-simulation implementation is complete for this checkpoint
+and was committed and pushed to both remotes.
+
+- Commit: `ce97c67 feat: add guarded mental simulation solver`
+- Branch: `codex/control-001-seed`
+- Pushed to both `origin` and `personal` listed below.
+- Working tree was clean immediately after the commit. Temporary local
+  diagnostic JSON files were removed; their relevant findings are summarized in
+  this document.
+
+Completed in this checkpoint:
+
+- Added v21 mental-simulation notebook generation and artifact.
+- Wired the self-grading `Dream` model into the production `Pilot`.
+- Added a one-step, observe-and-replan movement planner.
+- Added held-out validation and one-step planning for predictable paint/teleport
+  clicks.
+- Preserved v20 as a conservative control by skipping mental observation there.
+- Added a local Pilot-only diagnostic harness, unit tests, README documentation,
+  and reproducible notebook safety/control checks.
+
 ## Goal
 
 Build and evaluate the user's core loop for ARC-AGI-3:
