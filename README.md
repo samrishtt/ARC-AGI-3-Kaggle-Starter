@@ -1,6 +1,6 @@
 # ARC-AGI-3 Agent Optimization Research
 
-> Systematic ablation study and graft-stack optimization for the ARC Prize 2026 (ARC-AGI-3) Kaggle competition.
+> A Qwen-led ARC-AGI-3 solver with a deliberately bounded online world-model sidecar, plus the historical graft experiments that informed it.
 
 ## Research Overview
 
@@ -55,6 +55,29 @@ The agent is built on the [Tufa Labs TAAF framework](https://www.kaggle.com/data
 
 Each graft is individually flag-gated, blanket-guarded (any error degrades to stock behavior), and composable via the `composite.install(bm, flags={})` entry point.
 
+### Current v20 submission path
+
+The diagram above describes the historical graft research. The active Kaggle
+candidate keeps the exact, measured v12 Qwen run as its primary planner and
+adds no dependency on the unavailable `taaf_grafts` package.
+
+```text
+Qwen primary planner
+        │ action/frame history
+        ▼
+online world model ──► movement + passability + click semantics + HUD filtering
+        │
+        ├── verified cross-level route/click: at most 4 single actions per level
+        └── otherwise: return control to Qwen unchanged
+```
+
+The sidecar waits for at least 24 history entries, then learns only from
+observed transitions. At level boundaries it retains stable mechanics but clears
+board-specific state. It can act only when it has strong evidence from an
+earlier completed level: replaying a route toward a proven goal color, or
+issuing one central click after a high-confidence `step` classification. The
+purpose is transferable causal knowledge, not a hard-coded public-game solver.
+
 ## Repository Structure
 
 ```
@@ -74,6 +97,12 @@ Each graft is individually flag-gated, blanket-guarded (any error degrades to st
 │   ├── arc3-duck-v12 (1).ipynb
 │   └── archive (2).zip      # Source bundle with all graft modules
 ├── datasets/                 # Deployed Kaggle dataset bundle (taaf source share fork)
+├── arc3x/                    # Online world-model sidecar
+│   ├── percept.py            # Frame deltas, object masks, HUD filtering
+│   ├── mind.py               # Movement and passability hypotheses
+│   ├── clicks.py             # Learned click semantics
+│   └── autopilot.py          # Conservative Qwen-compatible controller
+├── tools/                    # Notebook build and validation tooling
 ├── create_experiment_notebook.py  # Automated notebook generator for experiments A-E
 ├── verify_grafts.py          # Local graft installation verification suite
 └── parse_exp_*.py            # Benchmark result analysis scripts
@@ -106,7 +135,7 @@ Our optimization strategy targets all three levers:
 ## Competition Context
 
 - **Competition**: [ARC Prize 2026 — ARC-AGI-3](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3)
-- **Model**: Qwen3.6-27B-FP8 served via vLLM on Kaggle H100 GPUs
+- **Current v12-derived candidates**: Qwen3.8-27B-FP8 served through the original Kaggle/vLLM setup
 - **Agent Framework**: Tufa Labs TAAF (The Agent Architecture Framework)
 - **Runtime**: ~2h 20m per submission, ~110 clones across ~25 game families
 
@@ -146,14 +175,13 @@ Run the fast validation checks from the repository root:
 $env:PYTHONPATH = "."
 .venv\Scripts\python.exe -m compileall -q arc3x tools
 .venv\Scripts\python.exe -m unittest discover -s tests -v
-.venv\Scripts\python.exe tools\verify_submission_notebook.py
 .venv\Scripts\python.exe arc3x\why_markers.py --steps 400
 ```
 
 The full scored suite is intentionally separate because it is CPU-intensive:
 `arc3x\suite.py --split both -w 10 --budget 3000`.
 
-To build the experimental human-mind Kaggle notebook from the known v17 base:
+To regenerate the v20 Kaggle notebooks from the known 2.14-scoring v12 base:
 
 ```powershell
 .venv\Scripts\python.exe tools\build_mind_notebook.py
@@ -172,5 +200,12 @@ This produces two notebooks:
   interventions per level and has no dependency on the later `taaf_grafts`
   import, which failed in the recorded v15 run.
 
-The sidecar's private score remains unmeasured and must not be treated as an
-improvement in advance.
+The known private Kaggle score for v12 is **2.14**. The separate 5.04 value is
+an offline six-game, four-pass diagnostic mean, not a private-leaderboard
+result. The sidecar's private score remains unmeasured and must not be treated
+as an improvement in advance. Submit the source-equivalent safety notebook
+first, then run the sidecar as an explicit A/B experiment.
+
+## Kaggle submission description (623/750 characters)
+
+> Architecture: a Qwen3.8 planning agent is the primary solver, wrapped by a lightweight online world-model sidecar. From action/frame history it induces movement rules, passability, click semantics (teleport, paint, widget, or inert), and masks HUD/countdown noise. It carries only stable mechanics across level boundaries while clearing board-specific state. The sidecar waits through the opening, then can take only a few single, model-verified actions toward a goal proven by an earlier level; otherwise Qwen continues unchanged. The aim is not a hard-coded game solver, but reusable causal knowledge learned during play.
